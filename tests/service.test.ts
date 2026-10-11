@@ -11,9 +11,10 @@ interface Created { id: string; ownerToken: string; createdAt: number; expiresAt
 interface Session { sessionId: string; sessionToken: string }
 const liveSockets: WebSocket[] = [];
 afterEach(() => { for (const socket of liveSockets.splice(0)) socket.close(1000, 'test complete'); });
-async function request(path: string, secret?: string, body?: unknown, method = body === undefined ? 'GET' : 'POST') {
+async function request(path: string, secret?: string, body?: unknown, method = body === undefined ? 'GET' : 'POST', cookie?: string) {
   const headers: Record<string, string> = {};
   if (secret) headers.Authorization = `Bearer ${secret}`;
+  if (cookie) headers.Cookie = cookie;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   return worker.fetch(new Request(`https://share.test${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) }), env);
 }
@@ -22,7 +23,9 @@ async function create(size = 3): Promise<Created> {
   expect(response.status).toBe(201); return response.json();
 }
 async function session(share: Created, role: 'owner' | 'receiver', caps: Partial<Capabilities> = {}): Promise<Session> {
-  const response = await request(`/api/shares/${share.id}/sessions`, role === 'owner' ? share.ownerToken : undefined, { role, capabilities: { ws: false, webrtc: false, readable: role === 'owner' ? share.files.map(f => f.id) : [], ...caps } });
+  // 这些 R2 生命周期回归用例显式授予源端管理员登录；匿名策略由 admin.test.ts 独立覆盖。
+  const cookie = role === 'owner' ? (await request('/api/admin/login', undefined, { password: env.ADMIN_TOKEN })).headers.get('Set-Cookie')!.split(';')[0] : undefined;
+  const response = await request(`/api/shares/${share.id}/sessions`, role === 'owner' ? share.ownerToken : undefined, { role, capabilities: { ws: false, webrtc: false, readable: role === 'owner' ? share.files.map(f => f.id) : [], ...caps } }, 'POST', cookie);
   expect(response.status).toBe(201); return response.json();
 }
 async function download(share: Created, receiver: Session): Promise<DownloadRequest> {

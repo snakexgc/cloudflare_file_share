@@ -5,13 +5,16 @@ import type { Limits } from '../worker/config';
 import { api, ApiError, delay } from './api';
 import { ControlSession } from './control';
 import { hashFile, VerifiedSink } from './sink';
+import type { DirectTransport } from './peer';
 
 export type Progress = (fileId: string, label: string, bytes: number, mode?: string, finished?: boolean) => void;
 const terminal = (task: DownloadRequest) => ['canceled', 'failed', 'completed'].includes(task.status);
 const messageOf = (error: unknown) => error instanceof Error ? error.message : String(error);
 class SourceReadError extends Error {}
+class SinkWriteError extends Error {}
 
 export class SendTask {
+  private unsubscribe?: () => void;
   private abort = new AbortController();
   private pc?: RTCPeerConnection;
   private channel?: RTCDataChannel;
@@ -21,11 +24,17 @@ export class SendTask {
   private ready = false;
   private running = false;
   private lastAck = Date.now();
-  constructor(public task: DownloadRequest, private file: File, private control: ControlSession, private conf: Limits, private stun: IceServer[], private progress: Progress) { this.acked = this.sent = task.offset; }
+  constructor(public task: DownloadRequest, private file: File, private control: ControlSession, private conf: Limits, private stun: IceServer[], private progress: Progress, private direct?: DirectTransport) { this.acked = this.sent = task.offset; }
   async start() {
     try {
       try { await this.file.slice(0, Math.min(1, this.file.size)).arrayBuffer(); } catch { throw new SourceReadError('本地文件不可读，请重新选择原文件'); }
       if (this.task.mode === 'ws') { void this.run(); return; }
+      if (this.task.peerId && this.direct) {
+        this.pc = this.direct.pc; this.channel = this.direct.channel;
+        this.unsubscribe = this.direct.subscribe(this.task.transferId, data => { if (typeof data === 'string') { try { this.credit(JSON.parse(data)); } catch (error) { void this.fail(error); } } }, () => { void this.fail(new Error('后台直连中断')); });
+        // 允许接收者先发 ACK；订阅后发送 ready 请求，接收端重发写入偏移。
+        this.channel.send(JSON.stringify({ kind: 'ready', transferId: this.task.transferId, epoch: this.task.epoch })); void this.run(); return;
+      }
       const pc = this.pc = new RTCPeerConnection({ iceServers: this.task.mode === 'turn' ? this.task.iceServers : this.stun, iceTransportPolicy: this.task.mode === 'turn' ? 'relay' : 'all' });
       pc.onicecandidate = event => { if (event.candidate && !this.abort.signal.aborted) void this.control.signal(this.task, 'rtc-ice', { candidate: event.candidate.toJSON() }).catch(error => this.fail(error)); };
       pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed' && !this.abort.signal.aborted) void this.fail(new Error('WebRTC 数据连接失败')); };
@@ -94,10 +103,12 @@ export class SendTask {
     try { await this.control.signal(this.task, error instanceof SourceReadError ? 'source-error' : 'transport-error', { message: messageOf(error) }); } catch { /* 接收端的超时机制仍会停止旧任务。 */ }
     this.progress(this.task.fileId, messageOf(error), this.acked, this.task.mode);
   }
-  stop() { this.abort.abort(new Error('旧传输已终止')); if (this.channel) { this.channel.onclose = null; this.channel.onerror = null; this.channel.close(); } this.pc?.close(); }
+  stop() { this.abort.abort(new Error('旧传输已终止')); this.unsubscribe?.(); if (!this.direct) { if (this.channel) { this.channel.onclose = null; this.channel.onerror = null; this.channel.close(); } this.pc?.close(); } }
 }
 
 export class ReceiveTask {
+  private unsubscribe?: () => void;
+  private r2Work: Promise<void> = Promise.resolve();
   private pc?: RTCPeerConnection;
   private channel?: RTCDataChannel;
   private ice: RTCIceCandidateInit[] = [];
@@ -109,10 +120,11 @@ export class ReceiveTask {
   private timeout?: ReturnType<typeof setTimeout>;
   private advancing = false;
   private finished = false;
+  private finalizing = false;
   private r2Running = false;
   private startedAttempt = '';
   private deferred: ControlEvent[] = [];
-  constructor(public task: DownloadRequest, public sink: VerifiedSink, private control: ControlSession, private conf: Limits, private stun: IceServer[], private progress: Progress) { this.received = sink.offset; }
+  constructor(public task: DownloadRequest, public sink: VerifiedSink, private control: ControlSession, private conf: Limits, private stun: IceServer[], private progress: Progress, private directFor?: (id?: string) => DirectTransport | undefined) { this.received = sink.offset; }
   async start(task = this.task) {
     if (this.finished || task.epoch < this.task.epoch) return;
     const attemptKey = `${task.epoch}:${task.transferId}:${task.status}`;
@@ -129,7 +141,13 @@ export class ReceiveTask {
     }
     this.progress(task.fileId, task.mode === 'p2p' ? '正在连接直传' : task.mode === 'turn' ? '正在连接 TURN' : task.mode === 'ws' ? '正在连接 WS 中继' : '准备云端下载', this.sink.offset, task.mode);
     if (task.mode === 'ws') { this.control.relayAck(task, this.sink.offset); this.armTimeout(); }
-    else if (task.mode === 'r2') { if (task.status === 'transferring') void this.downloadR2(); }
+    else if (task.mode === 'r2') { if (task.status === 'transferring') this.r2Work = this.downloadR2(); }
+    else if (task.peerId) {
+      const direct = this.directFor?.(task.peerId);
+      if (!direct) { void this.advance(new Error('预热直连已失效')); return; }
+      this.pc = direct.pc; this.channel = direct.channel;
+      this.unsubscribe = direct.subscribe(task.transferId, data => this.channelMessage(data), () => { void this.advance(new Error('后台直连中断')); }); this.ack(); this.armTimeout();
+    }
     else this.armTimeout(this.conf.connectTimeoutMs + 15000);
   }
   private armTimeout(ms = this.conf.ackTimeoutMs) {
@@ -139,13 +157,14 @@ export class ReceiveTask {
   async event(event: ControlEvent) {
     const task = event.request;
     if (!task || this.finished || task.epoch < this.task.epoch) return;
-    if (this.advancing && ['attempt', 'rtc-offer', 'rtc-ice', 'file-end', 'r2-ready'].includes(event.type)) { this.deferred.push(event); return; }
+    if (this.advancing && ['attempt', 'rtc-offer', 'rtc-ice', 'file-end', 'r2-ready', 'mode-change'].includes(event.type)) { this.deferred.push(event); return; }
+    if (event.type === 'mode-change') { await this.switchTo(String((event.data as { mode: string }).mode)); return; }
     if (event.type === 'attempt') { await this.start(task); return; }
     if (event.type === 'waiting-source') { this.stopTransport(); this.task = task; this.progress(task.fileId, '分享者离线或源文件不可读，等待恢复', this.sink.offset, task.mode); return; }
     if (event.type === 'expired' || event.type === 'canceled' || event.type === 'failed') { await this.fail(new Error(task.error ?? '此分享已结束')); return; }
     if (event.type === 'stop-attempt' || event.type === 'completed') return;
     if (event.type === 'relay-error' || event.type === 'transport-error' || event.type === 'r2-error') { await this.advance(new Error((event.data as { message?: string })?.message ?? task.error ?? '传输失败')); return; }
-    if (event.type === 'r2-ready') { this.task = task; void this.downloadR2(); return; }
+    if (event.type === 'r2-ready') { this.task = task; if (!this.r2Running) this.r2Work = this.downloadR2(); return; }
     if (event.type === 'file-end') { if (this.task.mode === 'ws') await this.finish((event.data as { sha256: string }).sha256); return; }
     if (event.type === 'rtc-offer') {
       if (this.pc) return;
@@ -170,12 +189,13 @@ export class ReceiveTask {
     channel.onopen = opened; if (channel.readyState === 'open') opened();
     channel.onerror = () => { void this.advance(new Error('DataChannel 读取失败')); };
     channel.onclose = () => { if (!this.finished && !this.advancing) void this.advance(new Error('数据通道中断')); };
-    channel.onmessage = event => {
-      if (typeof event.data === 'string') {
-        try { const data = JSON.parse(event.data) as { kind: string; epoch: number; transferId: string; sha256: string; size: number }; if (data.epoch !== this.task.epoch || data.transferId !== this.task.transferId) return; if (data.kind !== 'end' || data.size !== this.sink.file.size) throw new Error('文件完成消息无效'); void this.finish(data.sha256).catch(error => this.fail(error)); }
+    channel.onmessage = event => this.channelMessage(event.data);
+  }
+  private channelMessage(message: string | ArrayBuffer) {
+      if (typeof message === 'string') {
+        try { const data = JSON.parse(message) as { kind: string; epoch: number; transferId: string; sha256: string; size: number }; if (data.epoch !== this.task.epoch || data.transferId !== this.task.transferId) return; if (data.kind === 'ready') { this.ack(); return; } if (data.kind !== 'end' || data.size !== this.sink.file.size) throw new Error('文件完成消息无效'); void this.finish(data.sha256).catch(error => this.fail(error)); }
         catch (error) { void this.advance(error); }
-      } else this.frame(event.data as ArrayBuffer);
-    };
+      } else this.frame(message);
   }
   frame(buffer: ArrayBuffer) {
     if (this.finished || this.advancing) return;
@@ -190,7 +210,7 @@ export class ReceiveTask {
         await this.sink.write(frame.payload, frame.offset); this.pendingBytes -= frame.payload.byteLength;
         if (generation !== this.generation) return;
         this.ack(); this.armTimeout(); this.progress(this.task.fileId, '正在接收', this.sink.offset, this.task.mode);
-      }).catch(error => { void this.advance(error); });
+      }).catch(error => { void this.fail(error); });
     } catch (error) { void this.advance(error); }
   }
   private ack() {
@@ -198,10 +218,13 @@ export class ReceiveTask {
     else if (this.channel?.readyState === 'open') this.channel.send(JSON.stringify({ kind: 'ack', transferId: this.task.transferId, epoch: this.task.epoch, offset: this.sink.offset }));
   }
   private async finish(sha256: string) {
-    if (this.finished || this.advancing) return;
+    if (this.finished || this.advancing || this.finalizing) return; this.finalizing = true;
     clearTimeout(this.timeout); await this.serial;
+    if (this.finished || this.advancing) return;
     this.progress(this.task.fileId, '校验 SHA-256 并保存文件', this.sink.offset, this.task.mode);
-    const actual = await this.sink.finish(sha256); this.finished = true;
+    let actual: string;
+    try { actual = await this.sink.finish(sha256); } catch (error) { this.finalizing = false; await this.fail(error); return; }
+    this.finished = true;
     this.stopTransport();
     this.progress(this.task.fileId, this.sink.native ? '下载完成 · SHA-256 已校验' : 'SHA-256 已校验 · 已交给浏览器保存', this.sink.offset, this.task.mode, true);
     try { await this.control.signal(this.task, 'completed', { sha256: actual, size: this.sink.file.size }); } catch { /* 已校验并完成保存，不回退重新写入文件。 */ }
@@ -223,22 +246,25 @@ export class ReceiveTask {
               this.abort.signal.throwIfAborted();
               const next = await reader.read(); if (next.done) break;
               for (let offset = 0; offset < next.value.byteLength; offset += this.conf.hashChunkBytes) {
-                await this.sink.write(next.value.subarray(offset, offset + this.conf.hashChunkBytes), this.sink.offset);
+                this.abort.signal.throwIfAborted(); if (generation !== this.generation) return;
+                const chunk = next.value.subarray(offset, offset + this.conf.hashChunkBytes);
+                const write = this.serial.then(async () => { if (generation === this.generation) { try { await this.sink.write(chunk, this.sink.offset); } catch (error) { throw new SinkWriteError(messageOf(error)); } } });
+                this.serial = write.catch(() => {}); await write;
                 this.progress(this.task.fileId, '从云端直接下载', this.sink.offset, 'r2');
               }
             }
           } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
           await this.finish(auth.sha256); return;
         } catch (error) {
-          if (this.abort.signal.aborted || generation !== this.generation || this.finished || (error instanceof ApiError && [403, 409, 410, 429].includes(error.status)) || this.sink.closed || attempt === 1) throw error;
+          if (this.abort.signal.aborted || generation !== this.generation || this.finished || error instanceof SinkWriteError || (error instanceof ApiError && [403, 409, 410, 429].includes(error.status)) || this.sink.closed || attempt === 1) throw error;
           this.progress(this.task.fileId, '云端直连中断，正在从头重试', 0, 'r2'); await delay(1000, this.abort.signal);
         }
       }
-    } catch (error) { if (!this.abort.signal.aborted && !this.finished && generation === this.generation) await this.advance(error); }
+    } catch (error) { if (!this.abort.signal.aborted && !this.finished && generation === this.generation) { if (error instanceof SinkWriteError) await this.fail(error); else await this.advance(error); } }
     finally { this.r2Running = false; }
   }
   async advance(error: unknown) {
-    if (this.finished || this.advancing) return; this.advancing = true;
+    if (this.finished || this.advancing || this.finalizing) return; this.advancing = true;
     this.stopTransport(); await this.serial;
     try {
       this.progress(this.task.fileId, `正在切换传输方式：${messageOf(error)}`, this.sink.offset, this.task.mode);
@@ -247,9 +273,22 @@ export class ReceiveTask {
       for (const event of this.deferred.splice(0)) if (event.type !== 'attempt') await this.event(event);
     } catch (failure) { this.advancing = false; await this.fail(failure); }
   }
-  private stopTransport() { this.generation++; clearTimeout(this.timeout); this.abort.abort(new Error('旧传输已停止')); if (this.channel) { this.channel.onclose = null; this.channel.onerror = null; this.channel.close(); } this.pc?.close(); this.pc = undefined; this.channel = undefined; }
-  async fail(error: unknown) { if (this.finished) return; this.finished = true; this.stopTransport(); await this.serial; await this.sink.abort().catch(() => {}); this.progress(this.task.fileId, `未完成：${messageOf(error)}`, this.sink.offset, this.task.mode); }
-  async cancel() { if (this.finished) return; await this.fail(new Error('已取消')); await api(`${this.control.base}/download-requests/${this.task.id}`, this.control.sessionToken, undefined, 'DELETE').catch(() => {}); }
+  async upgrade(peerId: string) {
+    if (this.finished || this.advancing || this.finalizing || this.task.mode === 'p2p' || this.task.forcedMode || !this.directFor?.(peerId)) return;
+    await this.migrate('upgrade', { peerId });
+  }
+  async switchTo(mode: string) { if (!this.finished && !this.advancing && !this.finalizing) await this.migrate('switch', { mode }); }
+  private async migrate(operation: 'upgrade' | 'switch', choice: Record<string, string>) {
+    this.advancing = true; this.stopTransport(); await this.serial; await this.r2Work;
+    try {
+      const task = await api<DownloadRequest>(`${this.control.base}/download-requests/${this.task.id}/${operation}`, this.control.sessionToken, { epoch: this.task.epoch, offset: this.sink.offset, ...choice });
+      this.advancing = false; await this.start(task);
+      for (const event of this.deferred.splice(0)) if (event.type !== 'attempt') await this.event(event);
+    } catch (error) { this.advancing = false; await this.advance(error); }
+  }
+  private stopTransport() { this.generation++; clearTimeout(this.timeout); this.abort.abort(new Error('旧传输已停止')); this.unsubscribe?.(); this.unsubscribe = undefined; if (!this.task.peerId) { if (this.channel) { this.channel.onclose = null; this.channel.onerror = null; this.channel.close(); } this.pc?.close(); } this.pc = undefined; this.channel = undefined; }
+  async fail(error: unknown) { if (this.finished) return; this.finished = true; this.stopTransport(); await this.serial; await this.sink.abort().catch(() => {}); this.progress(this.task.fileId, `未完成：${messageOf(error)}`, this.sink.offset, this.task.mode); await api(`${this.control.base}/download-requests/${this.task.id}`, this.control.sessionToken, undefined, 'DELETE').catch(() => {}); }
+  async cancel() { if (!this.finished) await this.fail(new Error('已取消')); }
   get done() { return this.finished; }
   get connected() { return this.channel?.readyState === 'open' && !this.finished; }
 }

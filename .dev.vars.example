@@ -8,4 +8,4 @@
 # CF_ANALYTICS_API_TOKEN=your-account-analytics-read-token
 # TURNSTILE_SECRET_KEY=your-turnstile-secret
 # TURNSTILE_SITE_KEY=your-turnstile-site-key
-# ADMIN_TOKEN=random-secret-for-budget-monitoring
+# ADMIN_TOKEN=random-secret-for-admin-login-and-r2-authorization

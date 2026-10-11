@@ -1,5 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
-import type { ControlEvent, DownloadRequest, FileInfo, SessionInfo, ShareInfo, UploadAttempt } from '../shared/types';
+import type { ControlEvent, DownloadRequest, FileInfo, Mode, PeerLink, SessionInfo, ShareInfo, UploadAttempt } from '../shared/types';
+import { validAdmin } from './admin';
 import { chooseMultipartPartSize, decodeFrame, ID_PATTERN, SHA256_PATTERN, SINGLE_PUT_MAX_BYTES, urlTtl, validateFrame } from '../shared/protocol';
 import { limits, type Env } from './config';
 import { assert, bearer, budget, constantEqual, digest, errorResponse, HttpError, id, json, readJson, safeCapabilities, token } from './util';
@@ -7,7 +8,7 @@ import { findMultipartUploads, listParts, presign, r2Configured, validateParts }
 import { generateTurn, revokeTurn } from './turn';
 import { meteredDB } from './db';
 
-interface StoredFile extends FileInfo { r2Key?: string }
+interface StoredFile extends FileInfo { r2Key?: string; modeAdminHash?: string }
 interface Room {
   id: string;
   ownerTokenHash: string;
@@ -22,6 +23,8 @@ interface Room {
   uploads: UploadAttempt[];
   pendingRevocations: { usernames: string[]; expiresAt: number; reservationId?: string }[];
   nextCleanupAt?: number;
+  peers?: PeerLink[];
+  r2AdminHash?: string;
 }
 interface Relay { requestId: string; sent: number; acked: number; ready: boolean; lastAck: number; bytes: number; messages: number }
 const active = (r: DownloadRequest) => !['completed', 'canceled', 'failed'].includes(r.status);
@@ -51,7 +54,7 @@ export class ShareRoom extends DurableObject<Env> {
     });
   }
   private state() { assert(this.room, 404, 'share_not_found', '分享不存在'); return this.room; }
-  private file(fileId: string) { const file = this.state().files.find(x => x.id === fileId); assert(file, 404, 'file_not_found', '文件不存在'); return file; }
+  private file(fileId: string) { const file = this.state().files.find(x => x.id === fileId); assert(file && !file.deleted, 404, 'file_not_found', '文件不存在或已被管理员删除'); return file; }
   private socket(sessionId: string) { return this.ctx.getWebSockets(sessionId).find(x => x.readyState === WebSocket.OPEN); }
   private seenAt(session: SessionInfo) {
     let at = session.lastSeen;
@@ -66,7 +69,7 @@ export class ShareRoom extends DurableObject<Env> {
     const state = this.state(), owner = this.owner();
     return { id: state.id, createdAt: state.createdAt, expiresAt: state.expiresAt, status: state.status === 'active' && Date.now() >= state.expiresAt ? 'expired' : state.status,
       cleanupStatus: state.cleanupStatus, ownerStatus: !owner ? 'offline' : owner.capabilities.readable.length ? 'online' : 'file_unavailable',
-      activeRequests: state.requests.filter(active).length, files: state.files.map(({ r2Key: _r2Key, ...file }) => file) };
+      activeRequests: state.requests.filter(active).length, files: state.files.filter(x => !x.deleted).map(({ r2Key: _r2Key, modeAdminHash: _modeAdminHash, ...file }) => file) };
   }
   private ensureActive() {
     const state = this.state();
@@ -78,6 +81,8 @@ export class ShareRoom extends DurableObject<Env> {
     const session = [...this.sessions.values()].find(s => constantEqual(s.tokenHash, hash));
     assert(session, 403, 'session_forbidden', '控制会话无效，请重新连接');
     session.lastSeen = Date.now(); this.dirty.add(session.id);
+    const admin = request.headers.get('X-File-Share-Admin');
+    if (admin) { session.adminHash = admin; if (session.role === 'owner') this.state().r2AdminHash = admin; }
     return session;
   }
   private ownerAuth(request: Request, allowExpired = false) {
@@ -92,12 +97,13 @@ export class ShareRoom extends DurableObject<Env> {
     const socket = this.socket(sessionId);
     if (socket) { try { socket.send(JSON.stringify(data)); } catch { socket.close(1011, 'control send failed'); } }
   }
+  private publicTask(task: DownloadRequest): DownloadRequest { const { adminGrant: _grant, ...publicTask } = task; return publicTask; }
   private emit(sessionId: string | undefined, type: string, request?: DownloadRequest, data?: unknown) {
     if (!sessionId) return;
     const session = this.sessions.get(sessionId);
     if (!session) return;
     const conf = limits(this.env), now = Date.now();
-    const event: ControlEvent = { seq: ++session.seq, eventId: id(), type, request: request ? structuredClone(request) : undefined, data, createdAt: now };
+    const event: ControlEvent = { seq: ++session.seq, eventId: id(), type, request: request ? structuredClone(this.publicTask(request)) : undefined, data, createdAt: now };
     session.events = session.events.filter(x => now - x.createdAt < conf.eventTtlMs);
     session.events.push(event);
     while (session.events.length > conf.eventQueueSize || new TextEncoder().encode(JSON.stringify(session.events)).byteLength > conf.eventQueueBytes) session.events.shift();
@@ -196,10 +202,26 @@ export class ShareRoom extends DurableObject<Env> {
         return;
       } catch (error) { task.error = error instanceof Error ? error.message : 'WS 预算不足'; }
     }
-    this.startR2(task);
+    if (task.forcedMode === 'ws') { task.status = 'failed'; task.error = '指定的 WS 不可用'; this.both('failed', task); return; }
+    await this.startR2(task);
   }
-  private startR2(task: DownloadRequest) {
+  private async r2Allowed(task: DownloadRequest) {
+    const hashes = [task.adminGrant, this.state().r2AdminHash, this.sessions.get(task.receiverId)?.adminHash, task.ownerId ? this.sessions.get(task.ownerId)?.adminHash : undefined, this.owner(task.fileId)?.adminHash];
+    for (const hash of new Set(hashes)) if (await validAdmin(this.env, hash)) { task.adminGrant = hash; return true; }
+    return false;
+  }
+  private async r2Demand(fileId: string) {
+    for (const task of this.state().requests.filter(x => x.fileId === fileId && active(x) && x.mode === 'r2')) if (await this.r2Allowed(task)) return true;
+    return false;
+  }
+  private setMode(file: StoredFile, mode: unknown, hash: string) {
+    assert(['auto', 'p2p', 'turn', 'ws', 'r2'].includes(String(mode)), 400, 'invalid_mode', '传输方式无效');
+    file.forcedMode = mode === 'auto' ? undefined : mode as Mode; file.modeAdminHash = hash;
+    for (const task of this.state().requests.filter(x => x.fileId === file.id && active(x))) this.emit(task.receiverId, 'mode-change', task, { mode });
+  }
+  private async startR2(task: DownloadRequest) {
     const file = this.file(task.fileId);
+    if (!await this.r2Allowed(task) || !limits(this.env).r2Enabled || !r2Configured(this.env)) { task.status = 'failed'; task.error = '在线传输方式均不可用，R2 需要有效管理员登录'; this.both('failed', task); return; }
     task.mode = 'r2'; task.offset = 0; task.transferId = id(); task.status = file.uploadStatus === 'ready' ? 'transferring' : 'requested';
     this.both('attempt', task);
     if (file.uploadStatus === 'ready') this.emit(task.receiverId, 'r2-ready', task);
@@ -207,9 +229,16 @@ export class ShareRoom extends DurableObject<Env> {
   }
   private async activate(task: DownloadRequest) {
     const file = this.file(task.fileId), owner = this.owner(file.id), receiver = this.sessions.get(task.receiverId);
-    if (file.uploadStatus === 'ready') { this.startR2(task); return; }
+    if (file.forcedMode && await validAdmin(this.env, file.modeAdminHash)) { task.forcedMode ??= file.forcedMode; task.adminGrant ??= file.modeAdminHash; }
+    if (task.forcedMode === 'r2') { task.ownerId = owner?.id; await this.startR2(task); return; }
+    if (!task.forcedMode && !owner && file.uploadStatus === 'ready' && await this.r2Allowed(task)) { await this.startR2(task); return; }
     if (!owner || !receiver) { task.status = 'requested'; this.emit(task.receiverId, 'waiting-source', task); return; }
     task.ownerId = owner.id;
+    if (task.forcedMode === 'ws') { await this.chooseRelayOrR2(task); return; }
+    if (task.forcedMode === 'turn') { await this.startTurn(task); return; }
+    if (task.forcedMode === 'p2p' && (!owner.capabilities.webrtc || !receiver.capabilities.webrtc)) { task.status = 'failed'; task.error = '指定的 P2P 不可用，浏览器未提供 WebRTC'; this.both('failed', task); return; }
+    const peer = this.state().peers?.find(p => p.ownerId === owner.id && p.receiverId === receiver.id && p.ownerReady && p.receiverReady);
+    if (peer) task.peerId = peer.id; else delete task.peerId;
     if (owner.capabilities.webrtc && receiver.capabilities.webrtc) { task.mode = 'p2p'; task.status = 'connecting'; this.both('attempt', task); }
     else await this.chooseRelayOrR2(task);
   }
@@ -219,10 +248,18 @@ export class ShareRoom extends DurableObject<Env> {
     assert(typeof offset === 'number' && Number.isSafeInteger(offset) && offset >= 0 && offset <= file.size, 400, 'invalid_offset', '恢复偏移无效');
     await this.retireTransport(task);
     task.epoch++; task.offset = offset; task.transferId = id(); task.error = reason.slice(0, 200);
+    delete task.peerId;
     this.both('stop-attempt', task, { previous });
+    if (task.forcedMode) { task.status = 'failed'; this.both('failed', task); await this.noDemand(file.id); return; }
     if (!this.owner(file.id) && file.uploadStatus !== 'ready') { task.status = 'requested'; this.emit(task.receiverId, 'waiting-source', task); return; }
     if (previous === 'r2') { task.status = 'failed'; this.both('failed', task); await this.noDemand(file.id); return; }
-    if (previous === 'p2p' && limits(this.env).turnEnabled && file.size - offset <= limits(this.env).turnMaxFileBytes && this.env.TURN_KEY_ID && this.env.TURN_KEY_API_TOKEN) {
+    if (previous === 'p2p' && await this.startTurn(task)) return;
+    if (previous === 'p2p' || previous === 'turn') await this.chooseRelayOrR2(task);
+    else await this.startR2(task);
+  }
+  private async startTurn(task: DownloadRequest): Promise<boolean> {
+    const file = this.file(task.fileId), offset = task.offset;
+    if (this.owner(file.id)?.capabilities.webrtc && this.sessions.get(task.receiverId)?.capabilities.webrtc && limits(this.env).turnEnabled && file.size - offset <= limits(this.env).turnMaxFileBytes && this.env.TURN_KEY_ID && this.env.TURN_KEY_API_TOKEN) {
       const reservationId = `turn:${task.id}:${task.epoch}`, conf = limits(this.env);
       const ttl = urlTtl(this.state().expiresAt, conf.turnCredentialSeconds);
       try {
@@ -232,7 +269,7 @@ export class ShareRoom extends DurableObject<Env> {
         task.iceServers = await generateTurn(this.env, ttl);
         task.turnUsernames = task.iceServers.map(x => x.username!); task.turnExpiresAt = Date.now() + ttl * 1000;
         task.mode = 'turn'; task.status = 'connecting'; task.ownerId = this.owner(file.id)!.id;
-        this.ensureActive(); this.both('attempt', task); return;
+        this.ensureActive(); this.both('attempt', task); return true;
       } catch (error) {
         if (task.turnUsernames?.length) await this.retireTransport(task);
         else await budget(this.env, '/release', { id: reservationId });
@@ -240,8 +277,8 @@ export class ShareRoom extends DurableObject<Env> {
         this.ensureActive();
       }
     }
-    if (previous === 'p2p' || previous === 'turn') await this.chooseRelayOrR2(task);
-    else this.startR2(task);
+    if (task.forcedMode === 'turn') { task.status = 'failed'; task.error ??= '指定的 TURN 不可用'; this.both('failed', task); }
+    return false;
   }
   private async noDemand(fileId: string) {
     if (this.state().requests.some(r => r.fileId === fileId && active(r))) return;
@@ -269,7 +306,7 @@ export class ShareRoom extends DurableObject<Env> {
     if (['canceled', 'failed', 'aborted'].includes(attempt.status)) { await this.cleanAttempt(attempt); return; }
     attempt.status = 'canceled'; attempt.pausedUntil = undefined;
     attempt.recheckUntil = Math.max(attempt.signedUntil, Math.min(Date.now(), this.state().expiresAt)) + (attempt.signedUntil ? limits(this.env).lateCleanupGraceMs : 0);
-    const file = this.file(attempt.fileId);
+    const file = this.state().files.find(x => x.id === attempt.fileId)!;
     if (file.uploadStatus !== 'ready') file.uploadStatus = 'canceled';
     await this.updateAttempt(attempt); await this.saveFile(file);
     await this.env.DB.prepare('INSERT OR REPLACE INTO cleanup_tasks (id, share_id, target_type, target_key, upload_id, next_retry_at) VALUES (?, ?, ?, ?, ?, ?)').bind(attempt.id, this.state().id, attempt.mode, attempt.key, attempt.uploadId ?? null, Date.now()).run();
@@ -304,7 +341,7 @@ export class ShareRoom extends DurableObject<Env> {
     this.ensureActive();
     const file = this.file(fileId), conf = limits(this.env);
     assert(session.role === 'owner' && session.capabilities.readable.includes(fileId), 403, 'source_unavailable', '请重新选择并验证原文件');
-    assert(this.state().requests.some(x => x.fileId === fileId && active(x) && x.mode === 'r2'), 409, 'no_download_demand', '当前没有需要云端传输的下载请求');
+    assert(await this.r2Demand(fileId), 403, 'r2_admin_required', 'R2 需要有效管理员登录及下载需求');
     if (file.uploadStatus === 'ready') return json({ ready: true });
     assert(conf.r2Enabled && r2Configured(this.env), 503, 'r2_not_configured', 'R2 直传尚未配置，请联系服务管理员');
     let attempt = this.state().uploads.find(x => x.fileId === fileId && ['uploading', 'paused'].includes(x.status));
@@ -353,6 +390,7 @@ export class ShareRoom extends DurableObject<Env> {
     assert(typeof sha256 === 'string' && SHA256_PATTERN.test(sha256), 400, 'hash_required', '必须提交完整源文件 SHA-256');
     if (attempt.status === 'ready') { this.ensureActive(); assert(file.sha256 === sha256, 409, 'hash_mismatch', '源文件哈希不一致'); return json({ ready: true }); }
     this.ensureActive();
+    assert(await this.r2Demand(fileId), 403, 'r2_admin_required', 'R2 管理员授权已失效');
     assert(attempt.status === 'uploading', 409, 'upload_canceled', '此上传已取消或暂停');
     assert(!file.sha256 || file.sha256 === sha256, 409, 'source_changed', '源文件内容与原分享不一致');
     if (attempt.mode === 'multipart') {
@@ -450,6 +488,25 @@ export class ShareRoom extends DurableObject<Env> {
           this.room = await readJson<Room>(request); await this.persist(); return json({ ok: true });
         }
         if (path === '/internal/sweep') { await this.sweep(); await this.persist(); return json({ ok: true }); }
+        if (path === '/internal/admin/snapshot') return json({ ...this.snapshot(), files: this.state().files.map(({ modeAdminHash: _hash, ...file }) => file), sessions: [...this.sessions.values()].filter(s => this.online(s)).map(s => ({ id: s.id, role: s.role, lastSeen: this.seenAt(s), capabilities: s.capabilities })), requests: this.state().requests.map(({ adminGrant: _grant, ...task }) => task) });
+        if (path === '/internal/admin/revoke' && method === 'DELETE') { this.state().status = 'revoked'; await this.cleanup(); await this.persist(); return json({ ok: true }); }
+        const adminMode = path.match(/^\/internal\/admin\/files\/([a-f0-9]{32})\/mode$/);
+        if (adminMode && method === 'POST') {
+          const hash = request.headers.get('X-File-Share-Admin'), data = await readJson(request);
+          assert(await validAdmin(this.env, hash ?? undefined), 403, 'admin_required', '需要有效管理员登录'); this.ensureActive();
+          this.setMode(this.file(adminMode[1]), data.mode, hash!); await this.persist(); return json({ ok: true });
+        }
+        const deleteFile = path.match(/^\/internal\/admin\/files\/([a-f0-9]{32})$/);
+        if (deleteFile && method === 'DELETE') {
+          const file = this.state().files.find(f => f.id === deleteFile[1]); assert(file, 404, 'file_not_found', '文件不存在');
+          for (const task of this.state().requests.filter(t => t.fileId === file.id && active(t))) await this.cancelTask(task, '文件已被管理员删除');
+          for (const attempt of this.state().uploads.filter(a => a.fileId === file.id)) { if (attempt.status === 'ready') attempt.status = 'uploading'; await this.abortUpload(attempt); }
+          if (file.r2Key) await this.env.BUCKET.delete(file.r2Key);
+          file.deleted = true; file.uploadStatus = 'canceled'; delete file.r2Key;
+          await this.saveFile(file); await this.env.DB.prepare('UPDATE files SET deleted_at = ? WHERE id = ?').bind(Date.now(), file.id).run();
+          for (const s of this.sessions.values()) { s.capabilities.readable = s.capabilities.readable.filter(x => x !== file.id); this.dirty.add(s.id); this.emit(s.id, 'file-deleted', undefined, { fileId: file.id }); }
+          await this.persist(); return json({ ok: true, cleanupPending: this.state().uploads.some(a => a.fileId === file.id && a.status !== 'aborted') });
+        }
         const base = `/api/shares/${this.state().id}`, route = path.slice(base.length);
         assert(path.startsWith(base), 404, 'not_found', '接口不存在');
         if (route === '' && method === 'GET') { this.ensureActive(); return json(this.snapshot()); }
@@ -459,7 +516,8 @@ export class ShareRoom extends DurableObject<Env> {
           if (role === 'owner') assert(constantEqual(digest(bearer(request)), this.state().ownerTokenHash), 403, 'owner_forbidden', '管理令牌无效');
           await this.pruneSessions();
           assert(this.sessions.size < limits(this.env).maxSessions, 429, 'session_limit', '此分享的会话数量已达上限');
-          const sessionToken = token(), session: SessionInfo = { id: id(), tokenHash: digest(sessionToken), role, lastSeen: Date.now(), lastPoll: 0, capabilities: safeCapabilities(data.capabilities, this.state().files.map(x => x.id)), seq: 0, events: [], seen: [] };
+          const sessionToken = token(), session: SessionInfo = { id: id(), tokenHash: digest(sessionToken), role, lastSeen: Date.now(), lastPoll: 0, capabilities: safeCapabilities(data.capabilities, this.state().files.filter(x => !x.deleted).map(x => x.id)), seq: 0, events: [], seen: [], adminHash: request.headers.get('X-File-Share-Admin') ?? undefined };
+          if (role === 'owner' && session.adminHash) this.state().r2AdminHash = session.adminHash;
           this.sessions.set(session.id, session); this.dirty.add(session.id); await this.persist();
           return json({ sessionId: session.id, sessionToken, expiresAt: this.state().expiresAt }, 201);
         }
@@ -474,20 +532,60 @@ export class ShareRoom extends DurableObject<Env> {
           session.capabilities.ws = true; session.lastSeen = Date.now(); this.dirty.add(session.id); await this.persist();
           return new Response(null, { status: 101, webSocket: pair[0], headers: { 'Sec-WebSocket-Protocol': 'file-share' } });
         }
-        if (route === '/files-status' && method === 'GET') { const session = this.session(request); return json({ share: this.snapshot(), cursor: session.seq, requests: this.state().requests.filter(r => r.receiverId === session.id || r.ownerId === session.id) }); }
+        if (route === '/files-status' && method === 'GET') { const session = this.session(request); return json({ share: this.snapshot(), cursor: session.seq, requests: this.state().requests.filter(r => r.receiverId === session.id || r.ownerId === session.id).map(r => this.publicTask(r)) }); }
         if (route === '/events' && method === 'GET') {
           const session = this.session(request), now = Date.now(), conf = limits(this.env);
           assert(now - session.lastPoll >= conf.pollMinMs, 429, 'poll_rate', '轮询间隔过短'); session.lastPoll = now;
           const cursor = Number(new URL(request.url).searchParams.get('cursor') ?? 0);
           assert(Number.isSafeInteger(cursor) && cursor >= 0 && cursor <= session.seq, 400, 'invalid_cursor', '事件游标无效');
           session.events = session.events.filter(x => now - x.createdAt < conf.eventTtlMs); this.dirty.add(session.id);
-          if (cursor < (session.events[0]?.seq ?? session.seq + 1) - 1) { await this.persist(); throw new HttpError(409, 'resync_required', '控制事件已过期，请重新同步', { cursor: session.seq, share: this.snapshot(), requests: this.state().requests.filter(r => r.receiverId === session.id || r.ownerId === session.id) }); }
+          if (cursor < (session.events[0]?.seq ?? session.seq + 1) - 1) { await this.persist(); throw new HttpError(409, 'resync_required', '控制事件已过期，请重新同步', { cursor: session.seq, share: this.snapshot(), requests: this.state().requests.filter(r => r.receiverId === session.id || r.ownerId === session.id).map(r => this.publicTask(r)) }); }
           const events = session.events.filter(x => x.seq > cursor); await this.persist(); return json({ events, cursor: session.seq });
         }
         if (route === '/heartbeat' && method === 'POST') {
           const session = this.session(request), data = await readJson(request); await this.heartbeat(session, data.capabilities); await this.persist(); return json({ share: this.snapshot() });
         }
         if (route === '/signals' && method === 'POST') { const session = this.session(request); await this.signal(session, await readJson(request, limits(this.env).controlMaxBytes)); await this.persist(); return json({ ok: true }); }
+        if (route === '/peers' && method === 'POST') {
+          const session = this.session(request); assert(session.capabilities.webrtc, 409, 'rtc_unavailable', '浏览器不支持 WebRTC');
+          const peers = this.state().peers ??= [];
+          const live = new Set([...this.sessions.values()].filter(s => this.online(s) && s.capabilities.webrtc).map(s => s.id));
+          this.state().peers = peers.filter(p => live.has(p.ownerId) && live.has(p.receiverId));
+          for (const other of this.sessions.values()) {
+            if (!live.has(other.id) || other.role === session.role) continue;
+            const owner = session.role === 'owner' ? session : other, receiver = session.role === 'receiver' ? session : other;
+            if (!this.state().peers!.some(p => p.ownerId === owner.id && p.receiverId === receiver.id)) {
+              const peer: PeerLink = { id: id(), ownerId: owner.id, receiverId: receiver.id, generation: 0, ownerReady: false, receiverReady: false };
+              this.state().peers!.push(peer); this.emit(owner.id, 'peer-needed', undefined, peer); this.emit(receiver.id, 'peer-needed', undefined, peer);
+            }
+          }
+          await this.persist(); return json({ peers: this.state().peers!.filter(p => p.ownerId === session.id || p.receiverId === session.id) });
+        }
+        if (route === '/peer-signals' && method === 'POST') {
+          const session = this.session(request), data = await readJson(request, 32768);
+          const peer = this.state().peers?.find(p => p.id === data.peerId); assert(peer && (peer.ownerId === session.id || peer.receiverId === session.id), 403, 'peer_forbidden', '无此直连权限');
+          const owner = session.id === peer.ownerId, otherId = owner ? peer.receiverId : peer.ownerId;
+          const other = this.sessions.get(otherId); assert(other && this.online(other), 409, 'peer_offline', '对端已离线');
+          if (data.kind === 'offer') {
+            assert(owner && data.generation === peer.generation + 1, 409, 'peer_generation', '直连协商已更新'); peer.generation++; peer.ownerReady = peer.receiverReady = false;
+          } else assert(data.generation === peer.generation, 409, 'peer_generation', '直连协商已更新');
+          if (data.kind === 'ready' || data.kind === 'closed') {
+            if (owner) peer.ownerReady = data.kind === 'ready'; else peer.receiverReady = data.kind === 'ready';
+            if (peer.ownerReady && peer.receiverReady) { this.emit(peer.ownerId, 'peer-ready', undefined, peer); this.emit(peer.receiverId, 'peer-ready', undefined, peer); }
+          } else {
+            assert(['offer', 'answer', 'ice'].includes(String(data.kind)) && (data.kind !== 'answer' || !owner), 403, 'peer_signal_forbidden', '信令角色不符');
+            assert(data.payload && typeof data.payload === 'object' && JSON.stringify(data.payload).length <= (data.kind === 'ice' ? 2048 : 24576), 413, 'peer_signal_size', '直连信令无效或超限');
+            this.emit(otherId, 'peer-signal', undefined, { peer: structuredClone(peer), kind: data.kind, payload: data.payload });
+          }
+          await this.persist(); return json({ ok: true });
+        }
+        const policy = route.match(/^\/files\/([a-f0-9]{32})\/mode$/);
+        if (policy && method === 'POST') {
+          const session = this.session(request), data = await readJson(request), hash = request.headers.get('X-File-Share-Admin');
+          assert(await validAdmin(this.env, hash ?? undefined), 403, 'admin_required', '指定传输方式需要管理员登录');
+          const file = this.file(policy[1]); this.setMode(file, data.mode, hash!);
+          this.emit(session.id, 'file-mode', undefined, { fileId: file.id, mode: data.mode }); await this.persist(); return json({ ok: true });
+        }
         if (route === '/download-requests' && method === 'POST') {
           const session = this.session(request), data = await readJson(request);
           assert(session.role === 'receiver', 403, 'receiver_required', '请在接收页面请求下载'); this.file(String(data.fileId));
@@ -495,14 +593,37 @@ export class ShareRoom extends DurableObject<Env> {
           assert(this.state().requests.filter(active).length < limits(this.env).maxRequests, 429, 'download_limit', '下载并发已达上限');
           this.state().requests = this.state().requests.filter(active).concat(this.state().requests.filter(x => !active(x)).slice(-32));
           const task: DownloadRequest = { id: id(), fileId: String(data.fileId), receiverId: session.id, epoch: 1, mode: 'p2p', status: 'requested', offset: 0, transferId: id(), createdAt: Date.now() };
-          this.state().requests.push(task); await this.activate(task); await this.persist(); return json(task, 201);
+          if (data.mode && data.mode !== 'auto') { assert(await validAdmin(this.env, request.headers.get('X-File-Share-Admin') ?? undefined), 403, 'admin_required', '指定传输方式需要管理员登录'); assert(['p2p', 'turn', 'ws', 'r2'].includes(String(data.mode)), 400, 'invalid_mode', '传输方式无效'); task.forcedMode = data.mode as Mode; task.adminGrant = session.adminHash; }
+          this.state().requests.push(task); await this.activate(task); await this.persist(); return json(this.publicTask(task), 201);
         }
-        const downloadRoute = route.match(/^\/download-requests\/([a-f0-9]{32})(?:\/(advance))?$/);
+        const downloadRoute = route.match(/^\/download-requests\/([a-f0-9]{32})(?:\/(advance|upgrade|switch))?$/);
         if (downloadRoute) {
           const session = this.session(request, method === 'DELETE'), task = this.requestFor(downloadRoute[1], session);
           assert(task.receiverId === session.id, 403, 'receiver_required', '只能取消或切换本人的下载任务');
           if (method === 'DELETE' && !downloadRoute[2]) { if (active(task)) await this.cancelTask(task, '接收者取消下载'); await this.persist(); return json({ ok: true }); }
-          if (method === 'POST' && downloadRoute[2]) { const data = await readJson(request); this.requestFor(task.id, session, data.epoch); await this.advance(task, data.offset, String(data.reason ?? '连接或传输失败')); await this.persist(); return json(task); }
+          if (method === 'POST' && downloadRoute[2]) {
+            const data = await readJson(request); this.requestFor(task.id, session, data.epoch);
+            if (downloadRoute[2] === 'switch') {
+              const file = this.file(task.fileId), directAdmin = request.headers.get('X-File-Share-Admin');
+              assert(active(task) && ['auto', 'p2p', 'turn', 'ws', 'r2'].includes(String(data.mode)), 409, 'invalid_switch', '任务状态或传输方式无效');
+              const fileAuthorized = data.mode === (file.forcedMode ?? 'auto') && await validAdmin(this.env, file.modeAdminHash);
+              assert(fileAuthorized || await validAdmin(this.env, directAdmin ?? undefined), 403, 'admin_required', '切换指定方式需要管理员授权');
+              assert(typeof data.offset === 'number' && Number.isSafeInteger(data.offset) && data.offset >= task.offset && data.offset <= file.size, 400, 'invalid_offset', '恢复偏移无效');
+              await this.retireTransport(task); this.both('stop-attempt', task);
+              task.epoch++; task.offset = data.offset; task.transferId = id(); task.mode = 'p2p'; task.forcedMode = data.mode === 'auto' ? undefined : data.mode as Mode;
+              task.adminGrant = directAdmin ?? file.modeAdminHash; task.status = 'requested'; delete task.peerId; delete task.sourceHash;
+              await this.activate(task); await this.noDemand(file.id);
+            } else if (downloadRoute[2] === 'upgrade') {
+              assert(active(task) && !task.forcedMode && task.mode !== 'p2p', 409, 'upgrade_disabled', '指定方式或任务状态不允许自动切换');
+              const peer = this.state().peers?.find(p => p.id === data.peerId && p.ownerId === task.ownerId && p.receiverId === session.id && p.ownerReady && p.receiverReady);
+              assert(peer && this.owner(task.fileId)?.id === peer.ownerId, 409, 'peer_not_ready', '直连尚未就绪');
+              assert(typeof data.offset === 'number' && Number.isSafeInteger(data.offset) && data.offset >= task.offset && data.offset <= this.file(task.fileId).size, 400, 'invalid_offset', '恢复偏移无效');
+              await this.retireTransport(task); this.both('stop-attempt', task);
+              task.epoch++; task.offset = data.offset; task.transferId = id(); task.mode = 'p2p'; task.peerId = peer.id; task.status = 'connecting'; delete task.sourceHash;
+              this.both('attempt', task); await this.noDemand(task.fileId);
+            } else await this.advance(task, data.offset, String(data.reason ?? '连接或传输失败'));
+            await this.persist(); return json(this.publicTask(task));
+          }
         }
         const fileRoute = route.match(/^\/files\/([a-f0-9]{32})\/(uploads|identity|failure|complete|abort|download|parts\/(\d+)\/sign)$/);
         if (fileRoute && method === 'POST') {
@@ -519,6 +640,7 @@ export class ShareRoom extends DurableObject<Env> {
           if (operation === 'download') {
             const session = this.session(request), task = this.requestFor(String(data.requestId), session, data.epoch), file = this.file(fileId);
             assert(task.receiverId === session.id && active(task) && task.fileId === fileId && file.uploadStatus === 'ready' && file.r2Key && file.sha256, 409, 'file_not_ready', '完整云端文件尚未就绪');
+            assert(task.mode === 'r2' && await this.r2Allowed(task), 403, 'r2_admin_required', 'R2 管理员授权已失效');
             await budget(this.env, '/r2-operation', { kind: 'B' });
             return json({ ...await presign(this.env, file.r2Key, 'GET', this.state().expiresAt, { filename: file.name }), sha256: file.sha256, size: file.size });
           }
@@ -553,6 +675,7 @@ export class ShareRoom extends DurableObject<Env> {
             const result = await this.completeUpload(fileId, data.attemptId, data.sha256); await this.persist(); return result;
           }
           const attempt = this.uploadAttempt(fileId, data.attemptId), partNumber = Number(fileRoute[3]), file = this.file(fileId);
+          assert(await this.r2Demand(fileId), 403, 'r2_admin_required', 'R2 管理员授权已失效');
           assert(attempt.mode === 'multipart' && attempt.uploadId && attempt.status === 'uploading' && this.state().requests.some(x => x.fileId === fileId && active(x) && x.mode === 'r2'), 409, 'upload_paused', 'Multipart 已暂停或取消');
           assert(session && file.sha256 && attempt.verifiedSessionId === session.id, 409, 'source_identity_required', '签发分片前必须验证当前会话的完整源文件 SHA-256');
           assert(Number.isInteger(partNumber) && partNumber >= 1 && partNumber <= Math.ceil(file.size / attempt.partSize), 400, 'invalid_part', '分片编号无效');
@@ -637,6 +760,7 @@ export class ShareRoom extends DurableObject<Env> {
     for (const task of state.requests.filter(active)) {
       const receiver = this.sessions.get(task.receiverId), owner = task.ownerId ? this.sessions.get(task.ownerId) : undefined;
       if (!receiver || !this.online(receiver)) { await this.cancelTask(task, '接收者已离线'); continue; }
+      if (task.mode === 'r2' && !await this.r2Allowed(task)) { await this.cancelTask(task, 'R2 管理员登录已失效'); continue; }
       if (task.mode === 'ws') {
         const relay = this.relays.get(task.transferId);
         if (!relay || now - relay.lastAck >= conf.ackTimeoutMs) { task.error = 'WS 中继重启或 ACK 超时'; await this.retireTransport(task); this.both('relay-error', task); }

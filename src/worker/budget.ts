@@ -101,6 +101,16 @@ export class TURNBudget extends DurableObject<Env> {
           this.ledger.requests++;
           if (data.room === true) this.ledger.doRequests++;
           if (data.create === true) this.rate(`create:${source}`, conf.createsPerMinute, now);
+        } else if (path === '/turn-probe') {
+          this.rate(`turn-probe:${String(data.source)}`, 1, now);
+          this.rate('turn-probe:global', 60, now);
+        } else if (path === '/admin-login') {
+          for (const key of [`admin:${String(data.source)}`, 'admin:global']) {
+            const maximum = key === 'admin:global' ? 60 : 5;
+            const rate = this.ledger.rates[key];
+            if (!rate || rate.resetAt <= now) this.ledger.rates[key] = { count: 1, resetAt: now + 900000 };
+            else { assert(rate.count < maximum, 429, 'login_rate', '登录尝试过多，请 15 分钟后重试'); rate.count++; }
+          }
         } else if (path === '/d1-used') {
           const read = Number(data.read), written = Number(data.written);
           assert(Number.isSafeInteger(read) && read >= 0 && Number.isSafeInteger(written) && written >= 0, 400, 'invalid_usage', 'D1 使用量无效');

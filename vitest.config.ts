@@ -10,6 +10,7 @@ export default defineConfig(async () => ({
         LIMITS: JSON.stringify({ createsPerMinute: 100, maxSharesPerSource: 100, apiRequestsPerMinute: 2000, turnEnabled: true }),
         R2_ACCOUNT_ID: 'test-account', R2_ACCESS_KEY_ID: 'test-access', R2_SECRET_ACCESS_KEY: 'test-secret',
         TURN_KEY_ID: 'test-turn-key', TURN_KEY_API_TOKEN: 'test-turn-token', CF_ACCOUNT_ID: 'test-account', CF_ANALYTICS_API_TOKEN: 'test-analytics',
+        ADMIN_TOKEN: 'test-admin-password',
       },
     },
   })],

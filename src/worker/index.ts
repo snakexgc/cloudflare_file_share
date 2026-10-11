@@ -1,6 +1,8 @@
 import type { Env } from './config';
 import { limits } from './config';
-import { assert, budget, checkOrigin, constantEqual, digest, errorResponse, id, json, readJson, token } from './util';
+import { assert, budget, checkOrigin, digest, errorResponse, id, json, readJson, token } from './util';
+import { adminApi, adminHash } from './admin';
+import { generateTurn } from './turn';
 import { ID_PATTERN, validHours } from '../shared/protocol';
 import { r2Configured } from './r2';
 import { meteredDB } from './db';
@@ -57,19 +59,43 @@ async function handle(request: Request, env: Env): Promise<Response> {
   if (url.pathname.startsWith('/api/')) {
     checkOrigin(request);
     const source = digest(request.headers.get('CF-Connecting-IP') ?? 'local');
-    if (url.pathname === '/api/admin/budget') {
-      assert(env.ADMIN_TOKEN && constantEqual(request.headers.get('Authorization') ?? '', `Bearer ${env.ADMIN_TOKEN}`), 403, 'admin_forbidden', '管理权限不足');
-      return json(await budget(env, '/snapshot', {}));
-    }
+    const admin = await adminHash(request, env);
+    if (url.pathname.startsWith('/api/admin/')) return adminApi(request, env, source, admin);
     await budget(env, '/charge', { source, room: url.pathname.startsWith('/api/shares/'), create: url.pathname === '/api/shares' && request.method === 'POST', cleanup: request.method === 'DELETE' || (request.method === 'POST' && (url.pathname.endsWith('/abort') || url.pathname.endsWith('/failure'))) });
     if (url.pathname === '/api/config' && request.method === 'GET') {
       const conf = limits(env);
-      return json({ limits: conf, r2Configured: r2Configured(env), turnConfigured: Boolean(env.TURN_KEY_ID && env.TURN_KEY_API_TOKEN && env.CF_ANALYTICS_API_TOKEN), turnstileSiteKey: env.TURNSTILE_SITE_KEY ?? null, challengeRequired: Boolean(env.TURNSTILE_SECRET_KEY), stunServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] });
+      return json({ limits: { ...conf, r2Enabled: Boolean(admin) && conf.r2Enabled }, admin: Boolean(admin), r2Configured: Boolean(admin) && r2Configured(env), turnConfigured: Boolean(env.TURN_KEY_ID && env.TURN_KEY_API_TOKEN && env.CF_ANALYTICS_API_TOKEN), turnstileSiteKey: env.TURNSTILE_SITE_KEY ?? null, challengeRequired: Boolean(env.TURNSTILE_SECRET_KEY), stunServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] });
+    }
+    if (url.pathname === '/api/presence' && request.method === 'POST') {
+      const data = await readJson(request, 1024);
+      assert(typeof data.id === 'string' && ID_PATTERN.test(data.id) && typeof data.page === 'string' && /^(\/|\/admin|\/s\/[a-f0-9]{32})$/.test(data.page), 400, 'invalid_presence', '在线状态无效');
+      await env.DB.prepare('INSERT INTO presence (id, page, last_seen) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET page = excluded.page, last_seen = excluded.last_seen').bind(data.id, data.page, Date.now()).run();
+      return json({ ok: true });
+    }
+    if (url.pathname === '/api/probe/ws' && request.method === 'GET') {
+      assert(request.headers.get('Upgrade')?.toLowerCase() === 'websocket', 400, 'upgrade_required', '需要 WebSocket');
+      const pair = new WebSocketPair(); pair[1].accept();
+      const timer = setTimeout(() => pair[1].close(1000, 'probe complete'), 5000);
+      pair[1].addEventListener('message', event => { if (event.data === 'probe') pair[1].send('probe-ok'); pair[1].close(1000, 'probe complete'); clearTimeout(timer); });
+      return new Response(null, { status: 101, webSocket: pair[0] });
+    }
+    if (url.pathname === '/api/probe/turn' && request.method === 'POST') {
+      await budget(env, '/turn-probe', { source });
+      const reservation = `probe:${source}:${Math.floor(Date.now() / 60000)}`;
+      await budget(env, '/reserve', { id: reservation, kind: 'turn', bytes: 1048576, expiresAt: Date.now() + 60000 });
+      try { return json({ iceServers: await generateTurn(env, 60) }); }
+      catch (error) { await budget(env, '/release', { id: reservation }); throw error; }
+    }
+    if (url.pathname === '/api/probe/r2' && request.method === 'POST') {
+      assert(admin, 403, 'admin_required', 'R2 测试需要管理员登录'); assert(r2Configured(env) && limits(env).r2Enabled, 409, 'r2_disabled', 'R2 未启用或未配置');
+      await budget(env, '/r2-operation', { kind: 'A' }); await env.BUCKET.list({ prefix: 'temporary/', limit: 1 }); return json({ ok: true });
     }
     if (url.pathname === '/api/shares' && request.method === 'POST') return createShare(request, env, source);
     const match = url.pathname.match(/^\/api\/shares\/([a-f0-9]{32})(?:\/|$)/);
     assert(match && ID_PATTERN.test(match[1]), 404, 'not_found', '接口不存在');
-    return env.ROOMS.get(env.ROOMS.idFromName(match[1])).fetch(request);
+    const headers = new Headers(request.headers); headers.delete('X-File-Share-Admin');
+    if (admin) headers.set('X-File-Share-Admin', admin);
+    return env.ROOMS.get(env.ROOMS.idFromName(match[1])).fetch(new Request(request, { headers }));
   }
   assert(request.method === 'GET' || request.method === 'HEAD', 405, 'method_not_allowed', '页面仅支持 GET 或 HEAD');
   return env.ASSETS.fetch(request);
@@ -87,6 +113,7 @@ export default {
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
     env = { ...env, DB: meteredDB(env.DB, env) };
     ctx.waitUntil((async () => {
+      await env.DB.batch([env.DB.prepare('DELETE FROM admin_sessions WHERE expires_at <= ?').bind(Date.now()), env.DB.prepare('DELETE FROM presence WHERE last_seen <= ?').bind(Date.now() - 3600000)]);
       let cursor = '';
       while (true) {
         const rows = await env.DB.prepare("SELECT DISTINCT s.id FROM shares s LEFT JOIN cleanup_tasks c ON c.share_id = s.id WHERE s.id > ? AND ((s.expires_at <= ? AND s.cleanup_status != 'cleaned') OR s.status = 'revoked' OR c.next_retry_at <= ? OR (s.cleaned_at IS NOT NULL AND s.cleaned_at + ? <= ?)) ORDER BY s.id LIMIT 100").bind(cursor, Date.now(), Date.now(), limits(env).tombstoneMs, Date.now()).all<{ id: string }>();

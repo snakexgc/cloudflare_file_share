@@ -9,6 +9,8 @@ export interface FileInfo {
   lastModified: number;
   sha256?: string;
   uploadStatus: UploadStatus;
+  forcedMode?: Mode;
+  deleted?: boolean;
 }
 export interface ShareInfo {
   id: string;
@@ -21,6 +23,7 @@ export interface ShareInfo {
   files: FileInfo[];
 }
 export interface IceServer { urls: string | string[]; username?: string; credential?: string }
+export interface PeerLink { id: string; ownerId: string; receiverId: string; generation: number; ownerReady: boolean; receiverReady: boolean }
 export interface DownloadRequest {
   id: string;
   fileId: string;
@@ -38,6 +41,9 @@ export interface DownloadRequest {
   turnUsernames?: string[];
   turnExpiresAt?: number;
   sourceHash?: string;
+  forcedMode?: Mode;
+  adminGrant?: string;
+  peerId?: string;
 }
 export interface ControlEvent {
   seq: number;
@@ -58,6 +64,7 @@ export interface SessionInfo {
   seq: number;
   events: ControlEvent[];
   seen: string[];
+  adminHash?: string;
 }
 export interface UploadAttempt {
   id: string;
