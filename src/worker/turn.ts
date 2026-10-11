@@ -1,6 +1,11 @@
 import type { Env } from './config';
 import type { IceServer } from '../shared/types';
 import { assert } from './util';
+export function turnConfiguration(env: Env) {
+  const names = ['TURN_KEY_ID', 'TURN_KEY_API_TOKEN', 'CF_ACCOUNT_ID', 'CF_ANALYTICS_API_TOKEN'] as const;
+  const turnMissing = names.filter(name => !env[name]);
+  return { turnConfigured: turnMissing.length === 0, turnMissing };
+}
 
 export async function generateTurn(env: Env, ttl: number): Promise<IceServer[]> {
   assert(env.TURN_KEY_ID && env.TURN_KEY_API_TOKEN, 503, 'turn_not_configured', 'TURN 凭证尚未配置');

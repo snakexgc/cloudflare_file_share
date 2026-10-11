@@ -13,6 +13,6 @@
   "observability": { "enabled": true },
   "vars": {
     "R2_BUCKET_NAME": "file-share-temporary",
-    "LIMITS": "{}"
+    "LIMITS": "{\"turnEnabled\":true}"
   }
 }

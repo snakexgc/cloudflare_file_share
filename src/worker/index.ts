@@ -2,7 +2,7 @@ import type { Env } from './config';
 import { limits } from './config';
 import { assert, budget, checkOrigin, digest, errorResponse, id, json, readJson, token } from './util';
 import { adminApi, adminHash } from './admin';
-import { generateTurn } from './turn';
+import { generateTurn, turnConfiguration } from './turn';
 import { ID_PATTERN, validHours } from '../shared/protocol';
 import { r2Configured } from './r2';
 import { meteredDB } from './db';
@@ -64,7 +64,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
     await budget(env, '/charge', { source, room: url.pathname.startsWith('/api/shares/'), create: url.pathname === '/api/shares' && request.method === 'POST', cleanup: request.method === 'DELETE' || (request.method === 'POST' && (url.pathname.endsWith('/abort') || url.pathname.endsWith('/failure'))) });
     if (url.pathname === '/api/config' && request.method === 'GET') {
       const conf = limits(env);
-      return json({ limits: { ...conf, r2Enabled: Boolean(admin) && conf.r2Enabled }, admin: Boolean(admin), r2Configured: Boolean(admin) && r2Configured(env), turnConfigured: Boolean(env.TURN_KEY_ID && env.TURN_KEY_API_TOKEN && env.CF_ANALYTICS_API_TOKEN), turnstileSiteKey: env.TURNSTILE_SITE_KEY ?? null, challengeRequired: Boolean(env.TURNSTILE_SECRET_KEY), stunServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] });
+      return json({ limits: { ...conf, r2Enabled: Boolean(admin) && conf.r2Enabled }, admin: Boolean(admin), r2Configured: Boolean(admin) && r2Configured(env), ...turnConfiguration(env), turnstileSiteKey: env.TURNSTILE_SITE_KEY ?? null, challengeRequired: Boolean(env.TURNSTILE_SECRET_KEY), stunServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] });
     }
     if (url.pathname === '/api/presence' && request.method === 'POST') {
       const data = await readJson(request, 1024);

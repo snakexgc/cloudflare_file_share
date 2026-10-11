@@ -2,6 +2,7 @@ import type { ControlEvent, IceServer, PeerLink } from '../shared/types';
 import { decodeFrame } from '../shared/protocol';
 import { api } from './api';
 import type { ControlSession } from './control';
+import { rtcSupport } from './rtc';
 
 export interface DirectTransport {
   channel: RTCDataChannel;
@@ -85,7 +86,7 @@ export class PeerManager {
   onReady = (_peer: PeerLink) => {};
   onLocalReady = (_id: string) => {};
   constructor(public control: ControlSession, public stun: IceServer[], public status: (text: string) => void) {}
-  start() { if (!this.control.capabilities.webrtc) { this.status('此浏览器不支持 WebRTC'); return; } void this.sync(); this.timer = setInterval(() => { void this.sync(); }, 30000); }
+  start() { if (!this.control.capabilities.webrtc) { this.status(rtcSupport().message); return; } void this.sync(); this.timer = setInterval(() => { void this.sync(); }, 30000); }
   async sync() {
     if (this.syncing || this.stopped || this.control.stopped || !this.control.capabilities.webrtc) return; this.syncing = true;
     try {

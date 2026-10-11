@@ -6,7 +6,7 @@
   "doRequestsPerDay": 40000,
   "d1RowsReadPerDay": 3000000,
   "d1RowsWrittenPerDay": 80000,
-  "turnEnabled": false,
+  "turnEnabled": true,
   "turnMonthlyBytes": 850000000000,
   "turnSafetyBytes": 50000000000,
   "turnExternalReserveBytes": 100000000000,

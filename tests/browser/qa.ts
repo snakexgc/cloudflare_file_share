@@ -7,6 +7,7 @@ import type { Limits } from '../../src/worker/config';
 import { FRAME_HEADER_BYTES, WS_DEFAULT_PAYLOAD_BYTES, WS_MAX_MESSAGE_BYTES } from '../../src/shared/protocol';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
+import { rtcSupport } from '../../src/client/rtc';
 
 interface Handle { createWritable(): Promise<FileWriter>; getFile(): Promise<File> }
 interface Directory { getFileHandle(name: string, options: { create: boolean }): Promise<Handle>; removeEntry(name: string): Promise<void> }
@@ -19,8 +20,8 @@ async function run(mode: string) {
   let shareId = '', ownerToken = '', savedName = '', directory: Directory | undefined;
   let deadline: ReturnType<typeof setTimeout> | undefined, sink: VerifiedSink | undefined;
   try {
-    log(`浏览器 RTCPeerConnection 类型：${typeof RTCPeerConnection}`);
-    if (mode.startsWith('rtc') && typeof RTCPeerConnection !== 'function') { log('SKIP：当前浏览器禁用了 WebRTC 构造器；不会把自动回退成功当成直连验收。'); return; }
+    const support = rtcSupport(); log(`当前页面 RTCPeerConnection 类型：${support.constructorType}；可创建数据连接：${support.available}`);
+    if (mode.startsWith('rtc') && !support.available) { log(`SKIP：${support.message}；本次无法验收直连。`); return; }
     const config = await api<{ limits: Limits; stunServers: IceServer[] }>('/api/config');
     if (mode === 'ws-large' && config.limits.chunkBytes !== WS_DEFAULT_PAYLOAD_BYTES) throw new Error('大消息验收需要默认 WS 分片配置');
     const source = new Uint8Array(mode === 'zero' ? 0 : mode === 'ws-large' ? 2 * WS_DEFAULT_PAYLOAD_BYTES + 17 : 2 * 1024 ** 2 + 17);

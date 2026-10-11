@@ -11,8 +11,9 @@ import { bytesToHex } from '@noble/hashes/utils.js';
 import { PeerManager } from '../src/client/peer';
 import { mountProbes, punchStatus } from '../src/client/probe';
 import { adminMain } from './admin';
+import { rtcSupport } from '../src/client/rtc';
 
-interface PublicConfig { admin: boolean; limits: Limits; stunServers: IceServer[]; r2Configured: boolean; turnConfigured: boolean; challengeRequired: boolean; turnstileSiteKey?: string }
+interface PublicConfig { admin: boolean; limits: Limits; stunServers: IceServer[]; r2Configured: boolean; turnConfigured: boolean; turnMissing: string[]; challengeRequired: boolean; turnstileSiteKey?: string }
 const icons = {
   arrows: '<path d="M4 8h16m-4-4 4 4-4 4M20 16H4m4 4-4-4 4-4"/>',
   upload: '<path d="M12 16V4m-5 5 5-5 5 5M4 16v4h16v-4"/>',
@@ -162,7 +163,7 @@ const progress: Progress = (fileId, label, bytes, mode, finished) => {
 };
 async function startControl() {
   if (!share || control || ended) return;
-  control = new ControlSession(share.id, ownerToken ? 'owner' : 'receiver', { webrtc: typeof RTCPeerConnection === 'function', ws: typeof WebSocket === 'function', readable: [...sources.keys()] }, config.limits, ownerToken);
+  control = new ControlSession(share.id, ownerToken ? 'owner' : 'receiver', { webrtc: rtcSupport().available, ws: typeof WebSocket === 'function', readable: [...sources.keys()] }, config.limits, ownerToken);
   peers = new PeerManager(control, config.stunServers, punchStatus);
   peers.onReady = peer => { for (const receiver of receivers.values()) if (!receiver.done && receiver.task.ownerId === peer.ownerId) void receiver.upgrade(peer.id); };
   control.busy = () => [...receivers.values()].some(x => !x.done) || Boolean(share?.activeRequests);

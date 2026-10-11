@@ -85,3 +85,15 @@ R2 单 PUT 阈值保持 5 GiB 减 5 MiB。Multipart 最大目标大小由 64 MiB
 远端应用 `0002_admin.sql`，部署版本为 `5d1c728e-6806-4c18-b605-c8b03cf6f70d`。自定义域名验证通过：匿名配置关闭 R2、管理 overview / objects 与 R2 probe 返回 403、匿名任务不进入 R2、上传和强制 R2 请求被拒绝、WS 探测回显正常。生产 WSS 同一 67,106,729 字节文件再次保存并重读，帧大小和 SHA-256 与上述本地结果一致。两项线上验证只使用程序生成的测试分享，均已撤销；未删除用户分享或对象。
 
 浏览器检查已验证 `/admin` 登录、额度条形图、文件列表区域和在线页面统计。后续文件选择器与逐项视觉检查被 Edge 扩展界面暂停；当前浏览器环境未提供 WebRTC，因此未完成真实 IPv4/IPv6 跨 NAT 打洞、TURN 或跨 NAT 传输中热切换验证。页面会如实报告未提供 WebRTC，不伪造 NAT 类型或直连成功。标准能力边界及所依据官方文档见 README。
+
+## 2026-10-12 检测结果分层与 TURN 实网验证
+
+线上初始配置为 `turnConfigured: true`、`turnEnabled: false`：四个 TURN 变量已配置，部署开关仍关闭。部署配置与示例现已显式启用 TURN，保留账户统计、并发、流量与短期凭证预算限制。
+
+检测区现在区分服务端配置、凭据签发、浏览器 API 可创建性、ICE 候选和实际对端连通。缺少核心 API 仅报告「当前页面无法测试」，不推断浏览器产品不支持 WebRTC 或 NAT 不可打洞；缺失变量显示准确名称。快速复测复用仍有效的短期探测凭据，限速显示暂缓。自动验证累计 **93 项测试通过**，覆盖 API 未暴露/创建被阻止、TURN 已配置但关闭、服务签发成功但浏览器受限、候选不等于直连、无 ICE / relay 候选、复测缓存、限速与 CF_ACCOUNT_ID 配置检查。
+
+真实 Cloudflare TURN 验证使用现有密钥与统计令牌，只取得 60 秒探测凭据，不读取或打印长期密钥：统计预算准入与凭据签发通过；TLS-over-TCP IPv4 和 UDP IPv4 均完成认证 Allocate、双方 CreatePermission、两个真实 allocation 之间双向 Send / Data Indication，生成的 41 字节内容收发一致（每种接入方式双向共 82 字节）。测试结束 Refresh lifetime=0 释放 allocation 并关闭连接。IPv6 接入因本机系统解析 `ENOENT` 未完成，不能宣称 IPv6 实传通过。
+
+线上 Edge 页面实际显示安全上下文为「是」，`RTCPeerConnection: undefined`、`RTCSessionDescription: undefined`、`RTCIceCandidate: function`。说明当前页面的核心接口未暴露，不能完成浏览器 P2P 或 TURN DataChannel 测试；具体是哪项设置或扩展造成尚未定位。未改变浏览器隐私配置。TURN 服务验证已与这个客户端限制分开显示。
+
+最终部署版本 `e10d2949-6f09-45f8-817c-22a4a5f8db7d`。线上配置确认 `turnEnabled: true`、`turnConfigured: true`、`turnMissing: []`；匿名 R2 仍关闭，管理接口隔离和 WS 回显复测通过。构建与 TypeScript 检查通过。
