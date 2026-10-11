@@ -102,11 +102,15 @@ npx wrangler secret put ADMIN_TOKEN
 ```json
 "vars": {
   "R2_BUCKET_NAME": "file-share-temporary",
-  "LIMITS": "{\"turnEnabled\":true,\"turnExternalReserveBytes\":100000000000}"
+  "LIMITS": "{\"turnEnabled\":true}"
 }
 ```
 
 默认单文件 10 GiB、单分享 20 GiB、最多 32 个文件。WS 单文件默认最多 512 MiB，这是本项目的中继准入配置。Cloudflare 的 **32 MiB 限制作用于单条完整 WS 消息**，可以通过多条消息传输更大的完整文件；本项目每条消息有 52 字节协议头，并额外预留 1 KiB 链路余量，因此 `chunkBytes` 默认 **33,553,356 字节**，编码后的完整消息为 33,553,408 字节（32 MiB 减 1 KiB）。该余量来自云端实测：恰好达到 32 MiB 的消息在当前链路超时，预留 1 KiB 后连续大消息传输通过；它不是 Cloudflare 另行规定的上限。[DO 官方限制](https://developers.cloudflare.com/durable-objects/platform/limits/)
+
+**WS 不设累计流量上限。** `/admin` 显示当月已转发字节，包含正在传输的已转发数据；整个文件的预留字节不会被误记为实际流量。原 `wsMonthlyBytes` 和自设的 `wsMonthlyMessages` 已移除，WS 消息统一受 DO 请求预算控制。并发、单文件、内存窗口和超时仍是独立准入参数。
+
+**TURN 月上限为 950,000,000,000 字节（950 GB，十进制）**，对应 SFU / TURN 共享的首 1000 GB 免费额度的 95%。950 GB 已包含 5% 余量，原 `turnSafetyBytes` 已移除，不再重复扣减；`turnExternalReserveBytes` 默认 0，只有同账户使用 SFU 等其他共享服务时才明确填写。[Realtime 官方计费](https://developers.cloudflare.com/realtime/sfu/platform/pricing/)。
 
 WS 每任务窗口默认一块载荷，收到实际写入 ACK 后再发送下一块；每房间在途数据预算最多 64 MiB，默认最多同时准入两个 WS 文件任务，避免扩大块后同时扩大内存占用。ACK 超时默认 5 分钟，给慢网络传输大消息留出时间；存在尚未 ACK 的文件消息时改走 HTTPS 心跳，即使 `bufferedAmount` 已清空也维持源会话租约。断连、到期仍会提前终止。RTC 保持独立的 32 KiB 数据块和 1 MiB 窗口，并受协商的 SCTP `maxMessageSize` 约束，不套用 WS 的大消息窗口。
 
@@ -120,9 +124,22 @@ Multipart 仍串行浏览器直传，由服务端查询真实 parts 并合并。
 
 首次升级旧版本已存在的 Multipart 会话时，DO 会将旧配置的分片大小（旧默认 64 MiB）补入持久化状态；这些上传沿原边界完成，新创建的上传使用大分片策略。
 
-还可配置来源/IP 速率、活动分享数、会话数、下载并发、TURN 月预算/安全余量/凭证 TTL、WS 月字节/消息预算、R2 Class A/B 操作预算、轮询频率、控制队列容量与 TTL、在线租约和清理宽限。默认业务请求 25,000/UTC 日、保守 DO 请求 40,000/UTC 日、D1 实际扫描行 3,000,000/日及写入行 80,000/日。D1 使用量来自执行结果的 `rows_read`/`rows_written`；达到阈值后拒绝新业务，已登记的删除仍继续。
+请求类预算按 **Workers Free 计划免费额度的 95%** 配置，于 2026-10-12 核对；每日账本在 00:00 UTC 重置，月度账本按 UTC 自然月重置。
 
-这些是本服务的准入阈值，**不保证任意使用量或账户其他项目下账单为零**。DO 账本把 WS 消息按原始数量保守计入预算，不能替代 Cloudflare 实际账务；D1 单次操作完成后计量，可能有一次有界的阈值跨越。拒绝请求、静态页面、后台清理、未追踪的其他服务和已有 TURN allocations 仍可能耗用账户资源。TURN 已签发授权按完整预留量保守结算，不相信客户端报的收费字节；统计与已结算量相加可能重复计量，代价是更早拒绝新授权。
+| 配置 | 官方免费额度 | 本项目上限 |
+| --- | --- | --- |
+| `apiRequestsPerDay` | Worker 100,000 请求/日 | 95,000/日 |
+| `doRequestsPerDay` | DO 100,000 请求/日 | 95,000/日 |
+| `d1RowsReadPerDay` | D1 5,000,000 读取行/日 | 4,750,000/日 |
+| `d1RowsWrittenPerDay` | D1 100,000 写入行/日 | 95,000/日 |
+| `r2ClassAMonthly` | R2 Standard 1,000,000 次/月 | 950,000/月 |
+| `r2ClassBMonthly` | R2 Standard 10,000,000 次/月 | 9,500,000/月 |
+
+依据：[Workers 请求及静态资源](https://developers.cloudflare.com/workers/platform/pricing/)、[DO 请求与 WebSocket 消息](https://developers.cloudflare.com/durable-objects/platform/pricing/)、[D1 行计量](https://developers.cloudflare.com/d1/platform/pricing/)、[R2 Standard 操作](https://developers.cloudflare.com/r2/pricing/)。免费计划的日额度与付费计划的月度包含量不是同一个口径，当前目标是按免费计划保留 5% 请求余量。
+
+仅 `/api/*` 先运行 Worker；页面、JS、CSS 和 SPA 路由由 Static Assets 直接提供，保留 `_headers` 安全响应头，不消耗 Worker 业务请求计数。WS 控制消息不计入 Worker HTTP 请求；DO 估算将 HTTP / 内部调用与 WS 入站消息按官方 20:1 计费比例合并，并计入尚未完成的 WS 消息预留。管理内部房间查询、Cron 和 Alarm 也计入 DO 请求；D1 使用量来自实际 `rows_read` / `rows_written`。达到阈值后拒绝新业务，已授权管理与清理保留执行入口。
+
+这些是本服务的准入阈值，**不保证任意使用量或账户其他项目下账单为零**。DO 计数是应用侧估算，自动回复、运行时长与 DO 存储行数另有平台计量；本次 95% 限制针对上述请求类预算，不是全账户费用熔断。D1 执行后计量可有一次有界的阈值跨越；R2 直传短 URL 可被重复使用，签发计数不能替代所有实际 S3 请求。拒绝的请求、后台清理、其他服务和已有 TURN allocations 仍可能耗用账户资源。TURN 已签发授权按完整预留量保守结算，不相信客户端报的收费字节；统计与已结算量相加可能重复计量，代价是更早拒绝新授权。
 
 ## 文件完整性与恢复
 

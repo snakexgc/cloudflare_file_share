@@ -4,6 +4,27 @@ import { assert, budget, constantEqual, digest, json, readJson, token } from './
 import { ID_PATTERN } from '../shared/protocol';
 
 const cookieName = 'file_share_admin';
+async function managedRoom(env: Env, roomId: string, request: Request) {
+  await budget(env, '/do-used', { count: 1 });
+  return env.ROOMS.get(env.ROOMS.idFromName(roomId)).fetch(request);
+}
+async function wsUsage(env: Env, snapshot: Record<string, unknown>) {
+  const ids = snapshot.wsRoomIds as string[];
+  const live: { id: string; bytes: number }[] = [];
+  if (ids.length) await budget(env, '/do-used', { count: ids.length });
+  for (let i = 0; i < ids.length; i += 5) {
+    const responses = await Promise.all(ids.slice(i, i + 5).map(async roomId => {
+      const response = await env.ROOMS.get(env.ROOMS.idFromName(roomId)).fetch(new Request('https://room/internal/admin/ws-usage'));
+      assert(response.ok, 503, 'room_unavailable', '无法读取在传 WS 用量'); return response.json<{ transfers: { id: string; bytes: number }[] }>();
+    }));
+    for (const response of responses) live.push(...response.transfers);
+  }
+  // 结算可能在读取房间时发生：以最新预留 ID 过滤，避免已结算和在传字节重复计数。
+  const latest = ids.length ? await budget(env, '/snapshot', {}) : snapshot;
+  const pending = new Set((latest.wsTransfers as { id: string }[]).map(item => item.id));
+  const inFlight = live.filter(item => pending.has(item.id)).reduce((sum, item) => sum + item.bytes, 0);
+  return { ...latest, wsSettledBytes: Number(latest.wsBytes), wsLiveBytes: inFlight, wsBytes: Number(latest.wsBytes) + inFlight };
+}
 export async function validAdmin(env: Env, hash?: string): Promise<boolean> {
   if (!env.ADMIN_TOKEN || !hash || !/^[a-f0-9]{64}$/.test(hash)) return false;
   return Boolean(await env.DB.prepare('SELECT 1 FROM admin_sessions WHERE token_hash = ? AND key_hash = ? AND expires_at > ?').bind(hash, digest(env.ADMIN_TOKEN), Date.now()).first());
@@ -44,13 +65,14 @@ export async function adminApi(request: Request, env: Env, source: string, hash?
       env.DB.prepare('SELECT COUNT(*) AS files, COALESCE(SUM(size_bytes), 0) AS bytes, SUM(CASE WHEN upload_status = \'ready\' THEN 1 ELSE 0 END) AS ready FROM files').first(),
     ]);
     const count = await env.DB.prepare('SELECT COUNT(*) AS n FROM presence WHERE last_seen > ?').bind(Date.now() - limits(env).leaseMs).first('n');
-    return json({ ledger, totals, files: rooms, online: online.results, onlineCount: count, limits: limits(env), at: Date.now() });
+    return json({ ledger: await wsUsage(env, ledger), totals, files: rooms, online: online.results, onlineCount: count, limits: limits(env), at: Date.now() });
   }
   if (path === '/api/admin/shares' && request.method === 'GET') {
     const cursor = url.searchParams.get('cursor') ?? '';
     assert(!cursor || ID_PATTERN.test(cursor), 400, 'invalid_cursor', '游标无效');
     const rows = await env.DB.prepare('SELECT id FROM shares WHERE id > ? ORDER BY id LIMIT 21').bind(cursor).all<{ id: string }>();
     const shares = [];
+    if (rows.results.length) await budget(env, '/do-used', { count: Math.min(rows.results.length, 20) });
     for (let i = 0; i < Math.min(rows.results.length, 20); i += 5) {
       shares.push(...await Promise.all(rows.results.slice(i, Math.min(i + 5, 20)).map(async row => {
         const response = await env.ROOMS.get(env.ROOMS.idFromName(row.id)).fetch(new Request('https://room/internal/admin/snapshot'));
@@ -68,10 +90,10 @@ export async function adminApi(request: Request, env: Env, source: string, hash?
   const mode = path.match(/^\/api\/admin\/shares\/([a-f0-9]{32})\/files\/([a-f0-9]{32})\/mode$/);
   if (mode && request.method === 'POST') {
     const data = await readJson(request, 1024);
-    return env.ROOMS.get(env.ROOMS.idFromName(mode[1])).fetch(new Request(`https://room/internal/admin/files/${mode[2]}/mode`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-File-Share-Admin': hash! }, body: JSON.stringify(data) }));
+    return managedRoom(env, mode[1], new Request(`https://room/internal/admin/files/${mode[2]}/mode`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-File-Share-Admin': hash! }, body: JSON.stringify(data) }));
   }
   if (room && request.method === 'DELETE') {
-    return env.ROOMS.get(env.ROOMS.idFromName(room[1])).fetch(new Request(`https://room/internal/admin/${room[2] ? `files/${room[2]}` : 'revoke'}`, { method: 'DELETE' }));
+    return managedRoom(env, room[1], new Request(`https://room/internal/admin/${room[2] ? `files/${room[2]}` : 'revoke'}`, { method: 'DELETE' }));
   }
   if (path === '/api/admin/objects' && request.method === 'DELETE') {
     const data = await readJson(request, 2048);
@@ -79,7 +101,7 @@ export async function adminApi(request: Request, env: Env, source: string, hash?
     // 已登记的对象必须经过房间，取消签名与迟到上传，不能只删除桶中的当前版本。
     const match = data.key.split('/');
     const exists = await env.DB.prepare('SELECT 1 FROM files WHERE id = ? AND share_id = ?').bind(match[2], match[1]).first();
-    if (exists) return env.ROOMS.get(env.ROOMS.idFromName(match[1])).fetch(new Request(`https://room/internal/admin/files/${match[2]}`, { method: 'DELETE' }));
+    if (exists) return managedRoom(env, match[1], new Request(`https://room/internal/admin/files/${match[2]}`, { method: 'DELETE' }));
     await budget(env, '/r2-operation', { kind: 'A', cleanup: true }); await env.BUCKET.delete(data.key); return json({ ok: true });
   }
   assert(false, 404, 'not_found', '管理接口不存在');

@@ -1,6 +1,6 @@
 import type { Env } from './config';
 import { limits } from './config';
-import { assert, budget, checkOrigin, digest, errorResponse, id, json, readJson, token } from './util';
+import { assert, budget, checkOrigin, constantEqual, digest, errorResponse, id, json, readJson, token } from './util';
 import { adminApi, adminHash } from './admin';
 import { generateTurn, turnConfiguration } from './turn';
 import { ID_PATTERN, validHours } from '../shared/protocol';
@@ -44,6 +44,7 @@ async function createShare(request: Request, env: Env, source: string) {
       env.DB.prepare('INSERT INTO shares (id, owner_token_hash, source_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)').bind(shareId, digest(ownerToken), source, createdAt, expiresAt),
       ...files.map(f => env.DB.prepare('INSERT INTO files (id, share_id, name, size_bytes, mime, last_modified) VALUES (?, ?, ?, ?, ?, ?)').bind(f.id, shareId, f.name, f.size, f.mime, f.lastModified)),
     ]);
+    await budget(env, '/do-used', { count: 1 });
     const response = await env.ROOMS.get(env.ROOMS.idFromName(shareId)).fetch(new Request('https://room/internal/init', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: shareId, ownerTokenHash: digest(ownerToken), sourceHash: source, createdAt, expiresAt, status: 'active', cleanupStatus: 'pending', files, requests: [], uploads: [], pendingRevocations: [] }),
     }));
@@ -60,8 +61,10 @@ async function handle(request: Request, env: Env): Promise<Response> {
     checkOrigin(request);
     const source = digest(request.headers.get('CF-Connecting-IP') ?? 'local');
     const admin = await adminHash(request, env);
-    if (url.pathname.startsWith('/api/admin/')) return adminApi(request, env, source, admin);
-    await budget(env, '/charge', { source, room: url.pathname.startsWith('/api/shares/'), create: url.pathname === '/api/shares' && request.method === 'POST', cleanup: request.method === 'DELETE' || (request.method === 'POST' && (url.pathname.endsWith('/abort') || url.pathname.endsWith('/failure'))) });
+    const adminRoute = url.pathname.startsWith('/api/admin/');
+    const budgetBearer = url.pathname === '/api/admin/budget' && env.ADMIN_TOKEN && constantEqual(digest(request.headers.get('Authorization') ?? ''), digest(`Bearer ${env.ADMIN_TOKEN}`));
+    await budget(env, '/charge', { source, room: url.pathname.startsWith('/api/shares/'), create: url.pathname === '/api/shares' && request.method === 'POST', cleanup: Boolean(adminRoute && (admin || budgetBearer)) || request.method === 'DELETE' || (request.method === 'POST' && (url.pathname.endsWith('/abort') || url.pathname.endsWith('/failure'))) });
+    if (adminRoute) return adminApi(request, env, source, admin);
     if (url.pathname === '/api/config' && request.method === 'GET') {
       const conf = limits(env);
       return json({ limits: { ...conf, r2Enabled: Boolean(admin) && conf.r2Enabled }, admin: Boolean(admin), r2Configured: Boolean(admin) && r2Configured(env), ...turnConfiguration(env), turnstileSiteKey: env.TURNSTILE_SITE_KEY ?? null, challengeRequired: Boolean(env.TURNSTILE_SECRET_KEY), stunServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] });
@@ -113,12 +116,14 @@ export default {
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
     env = { ...env, DB: meteredDB(env.DB, env) };
     ctx.waitUntil((async () => {
+      await budget(env, '/charge', { source: 'cron', cleanup: true });
       await env.DB.batch([env.DB.prepare('DELETE FROM admin_sessions WHERE expires_at <= ?').bind(Date.now()), env.DB.prepare('DELETE FROM presence WHERE last_seen <= ?').bind(Date.now() - 3600000)]);
       let cursor = '';
       while (true) {
         const rows = await env.DB.prepare("SELECT DISTINCT s.id FROM shares s LEFT JOIN cleanup_tasks c ON c.share_id = s.id WHERE s.id > ? AND ((s.expires_at <= ? AND s.cleanup_status != 'cleaned') OR s.status = 'revoked' OR c.next_retry_at <= ? OR (s.cleaned_at IS NOT NULL AND s.cleaned_at + ? <= ?)) ORDER BY s.id LIMIT 100").bind(cursor, Date.now(), Date.now(), limits(env).tombstoneMs, Date.now()).all<{ id: string }>();
         if (!rows.results.length) break;
         for (let i = 0; i < rows.results.length; i += 5) {
+          await budget(env, '/do-used', { count: rows.results.slice(i, i + 5).length });
           const results = await Promise.allSettled(rows.results.slice(i, i + 5).map(async row => {
             const response = await env.ROOMS.get(env.ROOMS.idFromName(row.id)).fetch(new Request('https://room/internal/sweep', { method: 'POST' }));
             if (!response.ok) console.error(JSON.stringify({ type: 'cleanup-retry', shareId: row.id, status: response.status }));

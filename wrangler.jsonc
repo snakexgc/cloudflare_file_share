@@ -4,7 +4,7 @@
   "main": "src/worker/index.ts",
   "compatibility_date": "2026-10-11",
   "compatibility_flags": ["nodejs_compat"],
-  "assets": { "directory": "dist/web", "binding": "ASSETS", "not_found_handling": "single-page-application", "run_worker_first": true },
+  "assets": { "directory": "dist/web", "binding": "ASSETS", "not_found_handling": "single-page-application", "run_worker_first": ["/api/*"] },
   "d1_databases": [{ "binding": "DB", "database_name": "file-share-db", "database_id": "345acca2-b1e6-4e8d-8e9a-b2b0df65c917", "migrations_dir": "migrations" }],
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "file-share-temporary" }],
   "durable_objects": { "bindings": [{ "name": "ROOMS", "class_name": "ShareRoom" }, { "name": "BUDGET", "class_name": "TURNBudget" }] },

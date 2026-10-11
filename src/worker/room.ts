@@ -195,7 +195,7 @@ export class ShareRoom extends DurableObject<Env> {
       const reservationId = `ws:${task.id}:${task.epoch}`;
       try {
         const messages = Math.ceil((file.size - task.offset) / conf.chunkBytes) * 2 + 16;
-        await budget(this.env, '/reserve', { id: reservationId, kind: 'ws', bytes: file.size - task.offset, messages, expiresAt: this.state().expiresAt });
+        await budget(this.env, '/reserve', { id: reservationId, kind: 'ws', bytes: file.size - task.offset, messages, roomId: this.state().id, expiresAt: this.state().expiresAt });
         task.mode = 'ws'; task.ownerId = owner.id; task.transferId = id(); task.reservationId = reservationId; task.status = 'connecting';
         this.relays.set(task.transferId, { requestId: task.id, sent: task.offset, acked: task.offset, ready: false, lastAck: Date.now(), bytes: 0, messages: 0 });
         this.both('attempt', task);
@@ -488,6 +488,7 @@ export class ShareRoom extends DurableObject<Env> {
           this.room = await readJson<Room>(request); await this.persist(); return json({ ok: true });
         }
         if (path === '/internal/sweep') { await this.sweep(); await this.persist(); return json({ ok: true }); }
+        if (path === '/internal/admin/ws-usage') return json({ transfers: [...this.relays.values()].map(relay => ({ id: this.state().requests.find(task => task.id === relay.requestId)?.reservationId, bytes: relay.bytes })) });
         if (path === '/internal/admin/snapshot') return json({ ...this.snapshot(), files: this.state().files.map(({ modeAdminHash: _hash, ...file }) => file), sessions: [...this.sessions.values()].filter(s => this.online(s)).map(s => ({ id: s.id, role: s.role, lastSeen: this.seenAt(s), capabilities: s.capabilities })), requests: this.state().requests.map(({ adminGrant: _grant, ...task }) => task) });
         if (path === '/internal/admin/revoke' && method === 'DELETE') { this.state().status = 'revoked'; await this.cleanup(); await this.persist(); return json({ ok: true }); }
         const adminMode = path.match(/^\/internal\/admin\/files\/([a-f0-9]{32})\/mode$/);
@@ -710,7 +711,7 @@ export class ShareRoom extends DurableObject<Env> {
         assert(new TextEncoder().encode(message).byteLength <= limits(this.env).controlMaxBytes, 413, 'control_too_large', '控制消息超限');
         const data = JSON.parse(message) as Record<string, unknown>;
         if (data.type === 'relay-ack') { await this.relayAck(session, data); return; }
-        await budget(this.env, '/charge', { source: `session:${session.id}`, room: true });
+        await budget(this.env, '/charge', { source: `session:${session.id}`, websocket: true });
         if (data.type === 'signal') await this.signal(session, data);
         else if (data.type === 'heartbeat') await this.heartbeat(session, data.capabilities);
         else throw new HttpError(400, 'unknown_signal', '未知 WS 控制消息');
@@ -752,7 +753,7 @@ export class ShareRoom extends DurableObject<Env> {
       this.sessions.delete(session.id); await this.ctx.storage.delete(`session:${session.id}`);
     }
   }
-  async alarm() { await this.ctx.blockConcurrencyWhile(async () => { await this.sweep(); await this.persist(); }); }
+  async alarm() { await this.ctx.blockConcurrencyWhile(async () => { await budget(this.env, '/do-used', { count: 1 }); await this.sweep(); await this.persist(); }); }
   private async sweep() {
     if (!this.room) return;
     const state = this.room, now = Date.now(), conf = limits(this.env);

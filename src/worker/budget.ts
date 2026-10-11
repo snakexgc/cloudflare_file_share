@@ -9,12 +9,14 @@ interface Reservation {
   expiresAt: number;
   source?: string;
   ready?: boolean;
+  roomId?: string;
 }
 interface Ledger {
   month: string;
   day: string;
   requests: number;
   doRequests: number;
+  doWsMessages: number;
   d1Read: number;
   d1Written: number;
   turnCommitted: number;
@@ -32,9 +34,9 @@ export class TURNBudget extends DurableObject<Env> {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
       this.ledger = await ctx.storage.get<Ledger>('ledger') ?? {
-        month: '', day: '', requests: 0, doRequests: 0, d1Read: 0, d1Written: 0, turnCommitted: 0, wsCommitted: 0, wsMessages: 0, classA: 0, classB: 0, reservations: {}, rates: {},
+        month: '', day: '', requests: 0, doRequests: 0, doWsMessages: 0, d1Read: 0, d1Written: 0, turnCommitted: 0, wsCommitted: 0, wsMessages: 0, classA: 0, classB: 0, reservations: {}, rates: {},
       };
-      this.ledger.doRequests ??= 0; this.ledger.d1Read ??= 0; this.ledger.d1Written ??= 0;
+      this.ledger.doRequests ??= 0; this.ledger.doWsMessages ??= 0; this.ledger.d1Read ??= 0; this.ledger.d1Written ??= 0;
     });
   }
   private roll(now: number) {
@@ -42,7 +44,7 @@ export class TURNBudget extends DurableObject<Env> {
     if (this.ledger.month !== month) {
       Object.assign(this.ledger, { month, turnCommitted: 0, wsCommitted: 0, wsMessages: 0, classA: 0, classB: 0, turnSnapshot: undefined });
     }
-    if (this.ledger.day !== day) { this.ledger.day = day; this.ledger.requests = 0; this.ledger.doRequests = 0; this.ledger.d1Read = 0; this.ledger.d1Written = 0; }
+    if (this.ledger.day !== day) { this.ledger.day = day; this.ledger.requests = 0; this.ledger.doRequests = 0; this.ledger.doWsMessages = 0; this.ledger.d1Read = 0; this.ledger.d1Written = 0; }
     for (const [key, rate] of Object.entries(this.ledger.rates)) if (rate.resetAt <= now) delete this.ledger.rates[key];
     for (const [key, reservation] of Object.entries(this.ledger.reservations)) {
       // R2 和分享只在物理清理确认后释放；不能因时钟到期而提前释放存储预算。
@@ -60,9 +62,10 @@ export class TURNBudget extends DurableObject<Env> {
   }
   private sum(kind: Reservation['kind']) { return Object.values(this.ledger.reservations).filter(x => x.kind === kind).reduce((n, x) => n + x.bytes, 0); }
   private count(kind: Reservation['kind']) { return Object.values(this.ledger.reservations).filter(x => x.kind === kind).length; }
+  private doUsage(pending = 0) { return this.ledger.doRequests + Math.ceil((this.ledger.doWsMessages + pending) / 20); }
   private commit(reservation: Reservation, bytes: number, messages: number) {
     if (reservation.kind === 'turn') this.ledger.turnCommitted += reservation.bytes;
-    if (reservation.kind === 'ws') { this.ledger.wsCommitted += Math.min(reservation.bytes, bytes); this.ledger.wsMessages += Math.min(reservation.messages, messages); this.ledger.doRequests += Math.min(reservation.messages, messages); }
+    if (reservation.kind === 'ws') { const incoming = Math.min(reservation.messages, messages); this.ledger.wsCommitted += Math.min(reservation.bytes, bytes); this.ledger.wsMessages += incoming; this.ledger.doWsMessages += incoming; }
   }
   private async syncTurn(now: number) {
     const conf = limits(this.env);
@@ -92,14 +95,14 @@ export class TURNBudget extends DurableObject<Env> {
         if (path === '/charge') {
           const source = String(data.source ?? 'internal');
           const relayMessages = Object.values(this.ledger.reservations).filter(x => x.kind === 'ws').reduce((n, x) => n + x.messages, 0);
+          if (data.websocket === true) { this.ledger.doWsMessages++; this.ledger.wsMessages++; }
+          else { this.ledger.requests++; if (data.room === true) this.ledger.doRequests++; }
           if (data.cleanup === true) this.rate(`cleanup:${source}`, 30, now);
           else {
-            assert(this.ledger.requests < conf.apiRequestsPerDay, 429, 'api_budget', '今日请求预算已用完');
-            assert(this.ledger.doRequests + relayMessages < conf.doRequestsPerDay && this.ledger.d1Read < conf.d1RowsReadPerDay && this.ledger.d1Written < conf.d1RowsWrittenPerDay, 429, 'database_request_budget', '今日 DO 或 D1 请求预算已用完');
+            assert(data.websocket === true || this.ledger.requests <= conf.apiRequestsPerDay, 429, 'api_budget', '今日请求预算已用完');
+            assert(this.doUsage(relayMessages) <= conf.doRequestsPerDay && this.ledger.d1Read < conf.d1RowsReadPerDay && this.ledger.d1Written < conf.d1RowsWrittenPerDay, 429, 'database_request_budget', '今日 DO 或 D1 请求预算已用完');
             this.rate(`api:${source}`, conf.apiRequestsPerMinute, now);
           }
-          this.ledger.requests++;
-          if (data.room === true) this.ledger.doRequests++;
           if (data.create === true) this.rate(`create:${source}`, conf.createsPerMinute, now);
         } else if (path === '/turn-probe') {
           this.rate(`turn-probe:${String(data.source)}`, 1, now);
@@ -115,6 +118,10 @@ export class TURNBudget extends DurableObject<Env> {
           const read = Number(data.read), written = Number(data.written);
           assert(Number.isSafeInteger(read) && read >= 0 && Number.isSafeInteger(written) && written >= 0, 400, 'invalid_usage', 'D1 使用量无效');
           this.ledger.d1Read += read; this.ledger.d1Written += written;
+        } else if (path === '/do-used') {
+          const count = data.count;
+          assert(typeof count === 'number' && Number.isSafeInteger(count) && count >= 0, 400, 'invalid_usage', 'DO 请求数量无效');
+          this.ledger.doRequests += count;
         } else if (path === '/r2-ready') {
           const reservation = this.ledger.reservations[String(data.id)];
           if (reservation?.kind === 'r2') reservation.ready = true;
@@ -135,17 +142,17 @@ export class TURNBudget extends DurableObject<Env> {
             if (kind === 'turn') {
               assert(conf.turnEnabled, 409, 'turn_disabled', 'TURN 未启用');
               await this.syncTurn(now);
-              assert(this.count('turn') < conf.turnMaxConcurrent && this.ledger.turnSnapshot!.bytes + this.ledger.turnCommitted + this.sum('turn') + bytes + conf.turnSafetyBytes + conf.turnExternalReserveBytes <= conf.turnMonthlyBytes, 429, 'turn_budget', 'TURN 免费预算或并发额度不足');
+              assert(this.count('turn') < conf.turnMaxConcurrent && this.ledger.turnSnapshot!.bytes + this.ledger.turnCommitted + this.sum('turn') + bytes + conf.turnExternalReserveBytes <= conf.turnMonthlyBytes, 429, 'turn_budget', 'TURN 免费预算或并发额度不足');
             }
             if (kind === 'ws') {
               const messages = Number(data.messages);
               assert(Number.isSafeInteger(messages) && messages > 0, 400, 'invalid_reservation', '消息预算无效');
               const pending = Object.values(this.ledger.reservations).filter(x => x.kind === 'ws').reduce((n, x) => n + x.messages, 0);
-              assert(conf.wsEnabled && this.count('ws') < conf.wsMaxConcurrent && this.ledger.wsCommitted + this.sum('ws') + bytes <= conf.wsMonthlyBytes && this.ledger.wsMessages + pending + messages <= conf.wsMonthlyMessages && this.ledger.doRequests + pending + messages <= conf.doRequestsPerDay, 429, 'ws_budget', 'WS 中继预算或并发额度不足');
+              assert(conf.wsEnabled && this.count('ws') < conf.wsMaxConcurrent && this.doUsage(pending + messages) <= conf.doRequestsPerDay, 429, 'ws_budget', 'WS 中继请求预算或并发额度不足');
             }
             if (kind === 'r2') assert(conf.r2Enabled && Object.values(this.ledger.reservations).filter(x => x.kind === 'r2' && !x.ready).length < conf.r2MaxUploads && this.sum('r2') + bytes <= conf.r2MaxBytes, 429, 'r2_budget', 'R2 存储预算或上传额度不足');
             if (kind === 'share') assert(Object.values(this.ledger.reservations).filter(x => x.kind === 'share' && x.source === data.source).length < conf.maxSharesPerSource, 429, 'share_limit', '此来源的活动分享数量已达上限');
-            this.ledger.reservations[key] = { kind, bytes, messages: Number(data.messages ?? 0), expiresAt, source: typeof data.source === 'string' ? data.source : undefined };
+            this.ledger.reservations[key] = { kind, bytes, messages: Number(data.messages ?? 0), expiresAt, source: typeof data.source === 'string' ? data.source : undefined, roomId: typeof data.roomId === 'string' && /^[a-f0-9]{32}$/.test(data.roomId) ? data.roomId : undefined };
           }
         } else if (path === '/settle' || path === '/release') {
           const key = String(data.id), reservation = this.ledger.reservations[key];
@@ -157,13 +164,15 @@ export class TURNBudget extends DurableObject<Env> {
         await this.ctx.storage.put('ledger', this.ledger);
         return json(path === '/snapshot' ? {
           month: this.ledger.month, day: this.ledger.day, apiRequests: this.ledger.requests,
-          doRequests: this.ledger.doRequests, d1RowsRead: this.ledger.d1Read, d1RowsWritten: this.ledger.d1Written,
+          doRequests: this.doUsage(), doHttpRequests: this.ledger.doRequests, doWsMessages: this.ledger.doWsMessages, d1RowsRead: this.ledger.d1Read, d1RowsWritten: this.ledger.d1Written,
           turnMeasured: this.ledger.turnSnapshot, turnCommitted: this.ledger.turnCommitted, turnReserved: this.sum('turn'),
           wsBytes: this.ledger.wsCommitted, wsReserved: this.sum('ws'), wsMessages: this.ledger.wsMessages,
+          wsRoomIds: [...new Set(Object.values(this.ledger.reservations).filter(x => x.kind === 'ws' && x.roomId).map(x => x.roomId))],
+          wsTransfers: Object.entries(this.ledger.reservations).filter(([, value]) => value.kind === 'ws').map(([id, value]) => ({ id, roomId: value.roomId })),
           r2Bytes: this.sum('r2'), r2Reservations: this.count('r2'), classA: this.ledger.classA, classB: this.ledger.classB,
           r2ActiveUploads: Object.values(this.ledger.reservations).filter(x => x.kind === 'r2' && !x.ready).length,
         } : { ok: true });
-      } catch (error) { return errorResponse(error); }
+      } catch (error) { await this.ctx.storage.put('ledger', this.ledger); return errorResponse(error); }
     });
   }
 }

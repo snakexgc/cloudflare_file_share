@@ -31,10 +31,10 @@ export const defaults = {
   maxSharesPerSource: 5,
   createsPerMinute: 3,
   apiRequestsPerMinute: 180,
-  apiRequestsPerDay: 25000,
-  doRequestsPerDay: 40000,
-  d1RowsReadPerDay: 3000000,
-  d1RowsWrittenPerDay: 80000,
+  apiRequestsPerDay: 95000,
+  doRequestsPerDay: 95000,
+  d1RowsReadPerDay: 4750000,
+  d1RowsWrittenPerDay: 95000,
   controlMaxBytes: 65536,
   eventQueueSize: 128,
   eventQueueBytes: 65536,
@@ -54,12 +54,9 @@ export const defaults = {
   wsEnabled: true,
   wsMaxFileBytes: 512 * 1024 * 1024,
   wsMaxConcurrent: 32,
-  wsMonthlyBytes: 10 * 1024 ** 3,
-  wsMonthlyMessages: 500000,
   turnEnabled: false,
-  turnMonthlyBytes: 850 * 1000 ** 3,
-  turnSafetyBytes: 50 * 1000 ** 3,
-  turnExternalReserveBytes: 100 * 1000 ** 3,
+  turnMonthlyBytes: 950 * 1000 ** 3,
+  turnExternalReserveBytes: 0,
   turnMaxFileBytes: 256 * 1024 * 1024,
   turnMaxConcurrent: 16,
   turnCredentialSeconds: 600,
@@ -67,8 +64,8 @@ export const defaults = {
   r2Enabled: true,
   r2MaxBytes: 8 * 1000 ** 3,
   r2MaxUploads: 16,
-  r2ClassAMonthly: 800000,
-  r2ClassBMonthly: 8000000,
+  r2ClassAMonthly: 950000,
+  r2ClassBMonthly: 9500000,
   uploadUrlSeconds: 300,
   downloadUrlSeconds: 60,
   multipartPartBytes: SINGLE_PUT_MAX_BYTES,
@@ -86,7 +83,7 @@ export function limits(env: Pick<Env, 'LIMITS'>): Limits {
     const name = key as keyof Limits;
     if (typeof defaults[name] === 'boolean') {
       if (typeof value !== 'boolean') throw new Error(`${key} 必须是布尔值`);
-    } else if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < (['turnSafetyBytes', 'turnExternalReserveBytes'].includes(key) ? 0 : 1)) throw new Error(`${key} 必须是有效整数`);
+    } else if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < (key === 'turnExternalReserveBytes' ? 0 : 1)) throw new Error(`${key} 必须是有效整数`);
     Object.assign(result, { [key]: value });
   }
   if (result.chunkBytes + FRAME_HEADER_BYTES > WS_MAX_MESSAGE_BYTES || result.chunkBytes > result.windowBytes || result.windowBytes > result.roomBufferBytes || result.roomBufferBytes > 64 * 1024 ** 2 || result.rtcChunkBytes + FRAME_HEADER_BYTES > 65536 || result.rtcChunkBytes > result.rtcWindowBytes || result.rtcWindowBytes > 32 * 1024 ** 2 || result.hashChunkBytes > 32 * 1024 ** 2) throw new Error('数据块、窗口与缓冲配置不一致');
