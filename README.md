@@ -2,6 +2,8 @@
 
 匿名临时文件分享服务。浏览器优先通过 WebRTC 直连；失败后由服务端按 **P2P → TURN → WS 中继 → R2** 的顺序授权回退。Workers 提供页面和控制 API，SQLite Durable Objects 协调会话、流控与预算，D1 保存元数据，私有 R2 桶保存临时文件。
 
+在线地址：[临时传](https://cloudflare-file-share.9420.workers.dev)。源码：[GitHub 公开仓库](https://github.com/snakexgc/cloudflare_file_share)。
+
 项目使用 Wrangler 部署到 Cloudflare。未配置机密变量时，分享页面、P2P 信令与 WS 中继仍可运行；R2 直传和 TURN 需要补齐下文对应的机密变量。已完成的测试与待验证项目见 [验收记录](docs/validation.md)。
 
 ## 本地运行
@@ -102,7 +104,7 @@ npx wrangler r2 bucket create file-share-temporary
 
 将 D1 返回的 `database_id` 填入 `wrangler.jsonc`；部署到自己的账户时替换此 ID。DO 使用 SQLite-backed 的 `new_sqlite_classes` 迁移，两个类为 `ShareRoom`、`TURNBudget`。R2 使用 Standard 私有桶，关闭公开 bucket / r2.dev 下载入口。后续变更新增 SQL 迁移，不改已应用的迁移。
 
-将 [config/r2-cors.json](config/r2-cors.json) 中的示例来源替换为应用真正的 HTTPS origin，必要时单独增加本地联调 origin，勿用无约束来源：
+确认 [config/r2-cors.json](config/r2-cors.json) 中的来源与应用的 HTTPS origin 一致；部署到其他账户或更换域名时更新来源。必要时单独增加本地联调 origin，勿用无约束来源：
 
 ```powershell
 npx wrangler r2 bucket cors set file-share-temporary --file config/r2-cors.json

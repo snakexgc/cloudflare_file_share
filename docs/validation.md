@@ -32,3 +32,22 @@ Edge 浏览器通过本地验收入口调用生产的控制、发送、接收和
 配置 README 中的机密变量后，仍须验证真实 R2 单 PUT/大文件 Multipart、CORS/ETag、Content-Length 签名兼容性、签名到期与在途请求、Lifecycle 和远程 Alarm/Cron；验证 WebRTC 跨 NAT、TURN 统计 schema/额度及撤销对已有 allocation 的影响；验证常用文件格式、移动端和慢网络的大文件内存与落盘。
 
 本地联调真实 R2 时，S3 endpoint 与 `BUCKET` binding 必须指向同一账户和私有桶。在 Wrangler 的 R2 binding 中设置 `remote: true` 才能用远程对象执行 HEAD/Complete/Delete；只填 `.dev.vars` 而保留本地 binding，会把远程 PUT 与本地 HEAD 混用。当前测试和默认配置都使用本地 binding。
+
+## Cloudflare 部署与线上验收
+
+日期：2026-10-11。源码已发布到 [公开 GitHub 仓库](https://github.com/snakexgc/cloudflare_file_share)，应用使用项目内 Wrangler 部署至 [正式地址](https://cloudflare-file-share.9420.workers.dev)。Worker 版本为 `3b0e7c21-eb04-4a5d-b1ff-75dc5c1c3d60`。
+
+创建项目专用 D1 `file-share-db`，已应用 `0001_initial.sql`；创建 Standard 私有 R2 桶 `file-share-temporary`，确认 r2.dev 公共访问关闭。CORS 仅允许正式应用来源，支持 GET、HEAD、PUT 并暴露 ETag；`temporary/` 前缀配置 1 天对象清理和 1 天未完成 Multipart 清理。已部署 `ShareRoom`、`TURNBudget` SQLite Durable Objects，以及每 5 分钟的 Cron。
+
+发布前重新执行：52 项测试、TypeScript 检查、前端构建、Worker dry-run 与依赖审计均通过，审计报告 0 个漏洞。
+
+线上验证使用 Node.js 调用实际 HTTPS / WSS 地址，并复用生产二进制帧协议：
+
+- 首页和前端 JavaScript 正确返回 HTML / JavaScript 类型，安全响应头正常；`/api/config` 正确报告 R2 密钥未配置、TURN 默认关闭。
+- 创建 1 小时分享、公开读取文件元数据、创建 owner / receiver 会话、拒绝无管理令牌的 owner 会话，均符合预期。公开元数据不包含管理令牌。
+- HTTPS 提交的 WebRTC offer 信令到达指定接收会话；服务端授权 P2P → WS 回退，真实 WSS 接收窗口、ACK 和传输完成状态正常。
+- 实传 65,553 字节生成数据，发送与接收 SHA-256 均为 `44b097f701dd722c96d3e5b011742c51cc5b8c9816363f704e186e383af22f71`；第三个接收会话收到 0 个二进制文件帧。
+- 有实际 R2 下载需求时，缺少 S3 凭据的上传授权返回 `503 r2_not_configured`。
+- 测试分享均已撤销，随后公开访问返回 410；D1 显示撤销分享清理完成，上传记录和清理任务均为 0。撤销元数据按 tombstone 策略暂留。
+
+此次没有配置 Secrets。真实 R2 S3 上传 / 下载、跨网络 WebRTC / TURN，以及远程到期 Alarm / Cron 的时间触发行为，仍需补齐机密变量后联调。线上 WSS 验证不代表这些路径已经验证，也不代表浏览器原生文件保存对话框已验证。

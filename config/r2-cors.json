@@ -2,7 +2,7 @@
   "rules": [
     {
       "allowed": {
-        "origins": ["https://your-app.example.com"],
+        "origins": ["https://cloudflare-file-share.9420.workers.dev"],
         "methods": ["GET", "HEAD", "PUT"],
         "headers": ["Content-Type", "Range"]
       },
