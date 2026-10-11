@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cloudflare-file-share",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-10-11",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": { "directory": "dist/web", "binding": "ASSETS", "not_found_handling": "single-page-application", "run_worker_first": true },
+  "d1_databases": [{ "binding": "DB", "database_name": "file-share-db", "database_id": "00000000-0000-0000-0000-000000000000", "migrations_dir": "migrations" }],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "file-share-temporary" }],
+  "durable_objects": { "bindings": [{ "name": "ROOMS", "class_name": "ShareRoom" }, { "name": "BUDGET", "class_name": "TURNBudget" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ShareRoom", "TURNBudget"] }],
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "observability": { "enabled": true },
+  "vars": {
+    "R2_BUCKET_NAME": "file-share-temporary",
+    "LIMITS": "{}"
+  }
+}

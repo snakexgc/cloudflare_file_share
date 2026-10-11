@@ -1,0 +1,11 @@
+# 复制到 .dev.vars；所有密钥只留在服务端。未配置时 P2P / WS 仍可测试。
+# R2_ACCOUNT_ID=your-cloudflare-account-id
+# R2_ACCESS_KEY_ID=your-bucket-scoped-s3-access-key
+# R2_SECRET_ACCESS_KEY=your-s3-secret
+# TURN_KEY_ID=your-realtime-turn-key-id
+# TURN_KEY_API_TOKEN=your-turn-key-api-token
+# CF_ACCOUNT_ID=your-cloudflare-account-id
+# CF_ANALYTICS_API_TOKEN=your-account-analytics-read-token
+# TURNSTILE_SECRET_KEY=your-turnstile-secret
+# TURNSTILE_SITE_KEY=your-turnstile-site-key
+# ADMIN_TOKEN=random-secret-for-budget-monitoring

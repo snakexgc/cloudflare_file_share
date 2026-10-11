@@ -1,0 +1,35 @@
+{
+  "name": "cloudflare-file-share",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npm run build:web && wrangler dev --port 8787",
+    "dev:web": "vite --host 127.0.0.1",
+    "build:web": "vite build",
+    "build": "npm run check && npm run build:web && wrangler deploy --dry-run --outdir dist/worker",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:browser": "vite --config vite.qa.config.ts --host 127.0.0.1 --port 5175",
+    "db:local": "wrangler d1 migrations apply file-share-db --local",
+    "db:remote": "wrangler d1 migrations apply file-share-db --remote",
+    "deploy": "npm run check && npm run build:web && wrangler deploy"
+  },
+  "dependencies": {
+    "@noble/hashes": "2.4.0",
+    "aws4fetch": "1.0.20",
+    "fast-xml-parser": "^5.3.0",
+    "qrcode": "1.5.4"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.4.0",
+    "@cloudflare/workers-types": "5.20261011.1",
+    "@types/node": "^24.0.0",
+    "@types/qrcode": "1.5.5",
+    "typescript": "^5.9.3",
+    "vite": "8.3.4",
+    "vitest": "4.1.11",
+    "wrangler": "4.149.0"
+  }
+}
