@@ -1,6 +1,6 @@
 import { bytesToHex } from '@noble/hashes/utils.js';
 import type { ControlEvent, DownloadRequest, IceServer, UploadAuthorization } from '../shared/types';
-import { decodeFrame, encodeFrame, validateFrame } from '../shared/protocol';
+import { decodeFrame, encodeFrame, FRAME_HEADER_BYTES, validateFrame } from '../shared/protocol';
 import type { Limits } from '../worker/config';
 import { api, ApiError, delay } from './api';
 import { ControlSession } from './control';
@@ -65,12 +65,13 @@ export class SendTask {
     if (this.running) return; this.running = true;
     try {
       let hash;
-      try { hash = await hashFile(this.file, this.conf.chunkBytes, this.abort.signal, this.task.offset); } catch (error) { this.check(); throw new SourceReadError(messageOf(error)); }
+      try { hash = await hashFile(this.file, this.conf.hashChunkBytes, this.abort.signal, this.task.offset); } catch (error) { this.check(); throw new SourceReadError(messageOf(error)); }
       await this.wait(() => this.ready);
-      const chunkBytes = this.task.mode === 'ws' ? this.conf.chunkBytes : Math.min(this.conf.rtcChunkBytes, (this.pc?.sctp?.maxMessageSize || 65536) - 52);
+      const chunkBytes = this.task.mode === 'ws' ? this.conf.chunkBytes : Math.min(this.conf.rtcChunkBytes, (this.pc?.sctp?.maxMessageSize || 65536) - FRAME_HEADER_BYTES);
+      const windowBytes = this.task.mode === 'ws' ? this.conf.windowBytes : this.conf.rtcWindowBytes;
       while (this.sent < this.file.size) {
         this.check(); const length = Math.min(chunkBytes, this.file.size - this.sent);
-        await this.wait(() => this.sent + length - this.acked <= this.conf.windowBytes && (this.task.mode === 'ws' ? (this.control.socket?.bufferedAmount ?? Infinity) : (this.channel?.bufferedAmount ?? Infinity)) < this.conf.windowBytes);
+        await this.wait(() => this.sent + length - this.acked <= windowBytes && (this.task.mode === 'ws' ? (this.control.socket?.bufferedAmount ?? Infinity) : (this.channel?.bufferedAmount ?? Infinity)) < windowBytes);
         let payload: Uint8Array;
         try { payload = new Uint8Array(await this.file.slice(this.sent, this.sent + length).arrayBuffer()); } catch { throw new SourceReadError('读取本地文件失败'); }
         this.check(); if (payload.byteLength !== length) throw new SourceReadError('源文件读取长度发生变化');
@@ -182,7 +183,7 @@ export class ReceiveTask {
       const frame = decodeFrame(buffer), generation = this.generation;
       if (frame.epoch !== this.task.epoch || frame.transferId !== this.task.transferId) return;
       validateFrame(frame, { transferId: this.task.transferId, fileId: this.task.fileId, epoch: this.task.epoch, offset: this.received, size: this.sink.file.size });
-      if (this.pendingBytes + frame.payload.byteLength > this.conf.windowBytes) throw new Error('接收缓冲超出授权窗口');
+      if (this.pendingBytes + frame.payload.byteLength > (this.task.mode === 'ws' ? this.conf.windowBytes : this.conf.rtcWindowBytes)) throw new Error('接收缓冲超出授权窗口');
       this.received += frame.payload.byteLength; this.pendingBytes += frame.payload.byteLength;
       this.serial = this.serial.then(async () => {
         if (generation !== this.generation || this.finished) return;
@@ -221,8 +222,8 @@ export class ReceiveTask {
             while (true) {
               this.abort.signal.throwIfAborted();
               const next = await reader.read(); if (next.done) break;
-              for (let offset = 0; offset < next.value.byteLength; offset += this.conf.chunkBytes) {
-                await this.sink.write(next.value.subarray(offset, offset + this.conf.chunkBytes), this.sink.offset);
+              for (let offset = 0; offset < next.value.byteLength; offset += this.conf.hashChunkBytes) {
+                await this.sink.write(next.value.subarray(offset, offset + this.conf.hashChunkBytes), this.sink.offset);
                 this.progress(this.task.fileId, '从云端直接下载', this.sink.offset, 'r2');
               }
             }
@@ -268,7 +269,7 @@ export class UploadManager {
       const auth = await api<UploadAuthorization>(`${this.control.base}/files/${fileId}/uploads`, this.control.sessionToken, {});
       if (auth.shared || auth.ready) return;
       entry.attemptId = auth.attemptId; entry.abort.signal.throwIfAborted();
-      hashPromise = hashFile(file, this.conf.chunkBytes, entry.abort.signal); void hashPromise.catch(() => {});
+      hashPromise = hashFile(file, this.conf.hashChunkBytes, entry.abort.signal); void hashPromise.catch(() => {});
       if (auth.mode === 'put') await this.put(auth.url!, file, auth.headers!, entry.abort.signal, bytes => this.progress(fileId, '整文件直接上传到 R2', bytes, 'r2'));
       else {
         entry.hashingIdentity = true; this.progress(fileId, '校验源文件，确保分片续传使用原内容', 0, 'r2');

@@ -4,6 +4,7 @@ import { VerifiedSink, type FileWriter } from '../../src/client/sink';
 import { ReceiveTask, SendTask } from '../../src/client/transfer';
 import type { ControlEvent, DownloadRequest, FileInfo, IceServer } from '../../src/shared/types';
 import type { Limits } from '../../src/worker/config';
+import { FRAME_HEADER_BYTES, WS_DEFAULT_PAYLOAD_BYTES, WS_MAX_MESSAGE_BYTES } from '../../src/shared/protocol';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 
@@ -21,7 +22,8 @@ async function run(mode: string) {
     log(`浏览器 RTCPeerConnection 类型：${typeof RTCPeerConnection}`);
     if (mode.startsWith('rtc') && typeof RTCPeerConnection !== 'function') { log('SKIP：当前浏览器禁用了 WebRTC 构造器；不会把自动回退成功当成直连验收。'); return; }
     const config = await api<{ limits: Limits; stunServers: IceServer[] }>('/api/config');
-    const source = new Uint8Array(mode === 'zero' ? 0 : 2 * 1024 ** 2 + 17);
+    if (mode === 'ws-large' && config.limits.chunkBytes !== WS_DEFAULT_PAYLOAD_BYTES) throw new Error('大消息验收需要默认 WS 分片配置');
+    const source = new Uint8Array(mode === 'zero' ? 0 : mode === 'ws-large' ? 2 * WS_DEFAULT_PAYLOAD_BYTES + 17 : 2 * 1024 ** 2 + 17);
     for (let i = 0; i < source.length; i++) source[i] = (i * 79 + 53) % 256;
     const file = new File([source], mode === 'zero' ? '空文件.bin' : '浏览器验收.bin', { type: 'application/octet-stream', lastModified: 123 });
     const created = await api<{ id: string; ownerToken: string; files: FileInfo[] }>('/api/shares', undefined, { expiresInHours: 1, files: [{ name: file.name, size: file.size, mime: file.type, lastModified: file.lastModified }] });
@@ -30,6 +32,8 @@ async function run(mode: string) {
     const useRtc = mode.startsWith('rtc'), useWs = mode !== 'rtc-http';
     owner = new ControlSession(shareId, 'owner', { webrtc: useRtc, ws: useWs, readable: [created.files[0].id] }, config.limits, ownerToken);
     receiver = new ControlSession(shareId, 'receiver', { webrtc: useRtc, ws: useWs, readable: [] }, config.limits);
+    const frameSizes: number[] = [], binary = owner.binary.bind(owner);
+    owner.binary = buffer => { frameSizes.push(buffer.byteLength); binary(buffer); };
     owner.busy = receiver.busy = () => true;
     owner.onState = state => log(`发送端控制通道：${state}`); receiver.onState = state => log(`接收端控制通道：${state}`);
     const queue: ControlEvent[] = []; let ownerQueue = Promise.resolve(), receiverQueue = Promise.resolve();
@@ -76,6 +80,10 @@ async function run(mode: string) {
     if (mode.startsWith('rtc') && receiveTask.task.mode !== 'p2p') throw new Error(`原定 WebRTC 传输回退到了 ${receiveTask.task.mode}；不能视为直连通过`);
     const actual = new Uint8Array(await (await handle.getFile()).arrayBuffer()), expectedHash = bytesToHex(sha256(source)), actualHash = bytesToHex(sha256(actual));
     if (actual.length !== source.length || actualHash !== expectedHash) throw new Error('重新读取保存文件后哈希不匹配');
+    if (mode === 'ws-large') {
+      if (frameSizes.length !== 3 || frameSizes[0] !== WS_MAX_MESSAGE_BYTES - 1024 || frameSizes[1] !== WS_MAX_MESSAGE_BYTES - 1024 || frameSizes[2] !== FRAME_HEADER_BYTES + 17) throw new Error('WS 分片没有使用两条大消息和一条尾消息');
+      log(`完整 WS 消息字节数：${frameSizes.join(', ')}`);
+    }
     log(`保存文件字节数：${actual.length}`); log(`源 SHA-256：${expectedHash}`); log(`保存 SHA-256：${actualHash}`); log('PASS：真实传输、写入结束、原始内容与 SHA-256 全部一致');
   } catch (error) { log(`FAIL：${error instanceof Error ? error.message : String(error)}`); }
   finally {

@@ -1,6 +1,11 @@
 export const WS_MAX_MESSAGE_BYTES = 32 * 1024 * 1024;
 export const FRAME_HEADER_BYTES = 52;
+export const WS_MAX_PAYLOAD_BYTES = WS_MAX_MESSAGE_BYTES - FRAME_HEADER_BYTES;
+// 避免把实际网络消息顶在平台极值上；云端链路验证使用 1 KiB 余量。
+export const WS_DEFAULT_PAYLOAD_BYTES = WS_MAX_PAYLOAD_BYTES - 1024;
 export const SINGLE_PUT_MAX_BYTES = 5 * 1024 ** 3 - 5 * 1024 ** 2;
+export const MULTIPART_MIN_PART_BYTES = 5 * 1024 ** 2;
+export const MULTIPART_MAX_PARTS = 10000;
 export const FRAME_MAGIC = 0x46534831;
 export const ID_PATTERN = /^[a-f0-9]{32}$/;
 export const SHA256_PATTERN = /^[a-f0-9]{64}$/;
@@ -48,6 +53,14 @@ export function validateFrame(frame: Frame, expected: { transferId: string; file
   if (frame.offset !== expected.offset || frame.offset + frame.payload.byteLength > expected.size) throw new Error('块乱序、重复或越界');
 }
 export function validHours(value: unknown): value is number { return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 24; }
+/** 用最少的请求均衡分片；同一上传的非末片保持同样大小。 */
+export function chooseMultipartPartSize(size: number, maxPartBytes: number) {
+  if (!Number.isSafeInteger(size) || size <= SINGLE_PUT_MAX_BYTES || !Number.isSafeInteger(maxPartBytes) || maxPartBytes < MULTIPART_MIN_PART_BYTES || maxPartBytes > SINGLE_PUT_MAX_BYTES) throw new Error('Multipart 文件或分片大小无效');
+  const count = Math.ceil(size / maxPartBytes);
+  if (count > MULTIPART_MAX_PARTS) throw new Error('Multipart 分片数量超出 R2 限制');
+  const balanced = Math.ceil(size / count);
+  return balanced >= MULTIPART_MIN_PART_BYTES ? balanced : maxPartBytes;
+}
 export function urlTtl(expiresAt: number, configured: number, now = Date.now()) {
   const remaining = Math.floor((expiresAt - now) / 1000);
   if (remaining < 1) throw new Error('分享已过期');

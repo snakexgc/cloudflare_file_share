@@ -4,7 +4,7 @@ import { describe, expect, it, vi, afterEach } from 'vitest';
 import worker from '../src/worker/index';
 import type { Capabilities, DownloadRequest, FileInfo, ShareInfo, UploadAuthorization } from '../src/shared/types';
 import { digest, id } from '../src/worker/util';
-import { encodeFrame } from '../src/shared/protocol';
+import { encodeFrame, SINGLE_PUT_MAX_BYTES } from '../src/shared/protocol';
 import type { Env } from '../src/worker/config';
 
 interface Created { id: string; ownerToken: string; createdAt: number; expiresAt: number; files: FileInfo[] }
@@ -166,15 +166,51 @@ describe('R2 控制与补偿清理', () => {
     vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(share.expiresAt + 1);
     expect((await request(`/api/shares/${share.id}/files/${share.files[0].id}/complete`, owner.sessionToken, { attemptId: authorization.attemptId, sha256: digest('test') })).status).toBe(410);
   });
+  it.each([SINGLE_PUT_MAX_BYTES - 1, SINGLE_PUT_MAX_BYTES])('R2 的 %s 字节文件完整 PUT，不创建 Multipart 或签发多个请求', async size => {
+    const share = await create(size), owner = await session(share, 'owner'), receiver = await session(share, 'receiver'); await download(share, receiver);
+    const authorization = await upload(share, owner);
+    expect(authorization.mode).toBe('put'); expect(authorization.url).toBeTruthy();
+    expect(await env.DB.prepare('SELECT upload_id FROM upload_attempts WHERE id = ?').bind(authorization.attemptId).first('upload_id')).toBeNull();
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
   it('超过单次 PUT 上限才创建 Multipart；浏览器只得到具体 part 授权', async () => {
     const share = await create(5363466241), owner = await session(share, 'owner'), receiver = await session(share, 'receiver'); await download(share, receiver);
     vi.mocked(fetch).mockImplementation(async () => new Response('<ListPartsResult><IsTruncated>false</IsTruncated></ListPartsResult>'));
-    const authorization = await upload(share, owner); expect(authorization.mode).toBe('multipart'); expect(authorization.url).toBeUndefined();
+    const authorization = await upload(share, owner); expect(authorization.mode).toBe('multipart'); expect(authorization.url).toBeUndefined(); expect(authorization.partSize).toBe(2681733121);
     expect((await request(`/api/shares/${share.id}/files/${share.files[0].id}/parts/1/sign`, owner.sessionToken, { attemptId: authorization.attemptId })).status).toBe(409);
     expect((await request(`/api/shares/${share.id}/files/${share.files[0].id}/identity`, owner.sessionToken, { attemptId: authorization.attemptId, sha256: digest('large-test-file') })).status).toBe(200);
     const response = await request(`/api/shares/${share.id}/files/${share.files[0].id}/parts/1/sign`, owner.sessionToken, { attemptId: authorization.attemptId }); expect(response.status).toBe(200);
     const signed = new URL((await response.json() as { url: string }).url); expect(signed.searchParams.get('partNumber')).toBe('1'); expect(signed.searchParams.get('uploadId')).toBeTruthy();
-    const impossible = await request(`/api/shares/${share.id}/files/${share.files[0].id}/parts/10000/sign`, owner.sessionToken, { attemptId: authorization.attemptId }); expect(impossible.status).toBe(400);
+    expect((await request(`/api/shares/${share.id}/files/${share.files[0].id}/parts/2/sign`, owner.sessionToken, { attemptId: authorization.attemptId })).status).toBe(200);
+    const impossible = await request(`/api/shares/${share.id}/files/${share.files[0].id}/parts/3/sign`, owner.sessionToken, { attemptId: authorization.attemptId }); expect(impossible.status).toBe(400);
+  });
+  it('8 GB 只需两片，配置变更和 DO 重启均不改变已创建上传的分片边界', async () => {
+    const share = await create(8000000000), owner = await session(share, 'owner'), receiver = await session(share, 'receiver'); await download(share, receiver);
+    vi.mocked(fetch).mockImplementation(async () => new Response('<ListPartsResult><IsTruncated>false</IsTruncated></ListPartsResult>'));
+    const authorization = await upload(share, owner); expect(authorization.partSize).toBe(4000000000);
+    await request(`/api/shares/${share.id}/files/${share.files[0].id}/identity`, owner.sessionToken, { attemptId: authorization.attemptId, sha256: digest('large-test-file') });
+    vi.mocked(fetch).mockImplementation(async () => new Response('<ListPartsResult><IsTruncated>false</IsTruncated><Part><PartNumber>1</PartNumber><ETag>first-part</ETag><Size>4000000000</Size></Part></ListPartsResult>'));
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(share.id));
+    await runInDurableObject(stub, async instance => {
+      const instanceEnv = (instance as unknown as { env: Env }).env;
+      instanceEnv.LIMITS = JSON.stringify({ ...JSON.parse(instanceEnv.LIMITS ?? '{}'), multipartPartBytes: 64 * 1024 ** 2 });
+    });
+    const resumed = await upload(share, owner); expect(resumed.partSize).toBe(4000000000); expect(resumed.uploadedParts[0].size).toBe(4000000000);
+    expect((await request(`/api/shares/${share.id}/files/${share.files[0].id}/parts/3/sign`, owner.sessionToken, { attemptId: authorization.attemptId })).status).toBe(400);
+    await abortAllDurableObjects();
+    const restored = await upload(share, owner); expect(restored.partSize).toBe(4000000000); expect(restored.attemptId).toBe(authorization.attemptId);
+  });
+  it('首次升级已有的 v1 Multipart 状态时保留 64 MiB 边界，不套用新分片大小', async () => {
+    const share = await create(SINGLE_PUT_MAX_BYTES + 1), owner = await session(share, 'owner'), receiver = await session(share, 'receiver'); await download(share, receiver);
+    vi.mocked(fetch).mockImplementation(async () => new Response('<ListPartsResult><IsTruncated>false</IsTruncated></ListPartsResult>'));
+    const authorization = await upload(share, owner), stub = env.ROOMS.get(env.ROOMS.idFromName(share.id));
+    await runInDurableObject(stub, async (_instance, ctx) => {
+      const stored = await ctx.storage.get<{ uploads: { partSize?: number }[] }>('room'); delete stored!.uploads[0].partSize; await ctx.storage.put('room', stored);
+    });
+    await abortAllDurableObjects();
+    const restored = await upload(share, owner); expect(restored.partSize).toBe(64 * 1024 ** 2); expect(restored.attemptId).toBe(authorization.attemptId);
+    await abortAllDurableObjects();
+    expect((await upload(share, owner)).partSize).toBe(64 * 1024 ** 2);
   });
   it('到期清理幂等，按原截止时间删除，并保留 tombstone', async () => {
     const share = await create(), owner = await session(share, 'owner'), receiver = await session(share, 'receiver'); await download(share, receiver); const authorization = await upload(share, owner);
@@ -192,6 +228,14 @@ describe('R2 控制与补偿清理', () => {
   });
 });
 describe('WS 中继、流控与隔离', () => {
+  it('只在活跃中继期间保留 ACK 定时器，取消最后一个任务后允许正常休眠', async () => {
+    const share = await create(), owner = await session(share, 'owner', { ws: true }), receiver = await session(share, 'receiver', { ws: true });
+    await websocket(share, owner); await websocket(share, receiver);
+    const task = await download(share, receiver), stub = env.ROOMS.get(env.ROOMS.idFromName(share.id));
+    expect(await runInDurableObject(stub, instance => Boolean((instance as unknown as { relayTimer?: unknown }).relayTimer))).toBe(true);
+    await request(`/api/shares/${share.id}/download-requests/${task.id}`, receiver.sessionToken, undefined, 'DELETE');
+    expect(await runInDurableObject(stub, instance => Boolean((instance as unknown as { relayTimer?: unknown }).relayTimer))).toBe(false);
+  });
   it('实际 WS 只向获准接收者转发原始二进制；ACK 后完成', async () => {
     const share = await create(), owner = await session(share, 'owner', { webrtc: true, ws: true }), receiver = await session(share, 'receiver', { webrtc: true, ws: true }), visitor = await session(share, 'receiver', { ws: true });
     const sender = await websocket(share, owner), target = await websocket(share, receiver), observer = await websocket(share, visitor);
@@ -231,6 +275,10 @@ describe('WS 中继、流控与隔离', () => {
   });
   it('慢接收者不能扩大窗口，其超限不会终止另一接收者', async () => {
     const share = await create(1048577), owner = await session(share, 'owner', { ws: true }), one = await session(share, 'receiver', { ws: true }), two = await session(share, 'receiver', { ws: true });
+    await runInDurableObject(env.ROOMS.get(env.ROOMS.idFromName(share.id)), async instance => {
+      const instanceEnv = (instance as unknown as { env: Env }).env;
+      instanceEnv.LIMITS = JSON.stringify({ ...JSON.parse(instanceEnv.LIMITS ?? '{}'), chunkBytes: 262144, windowBytes: 1048576 });
+    });
     const sender = await websocket(share, owner), slow = await websocket(share, one), fast = await websocket(share, two), a = await download(share, one), b = await download(share, two);
     let credit = nextMessage(sender, kind('relay-credit')); slow.send(JSON.stringify({ type: 'relay-ack', transferId: a.transferId, epoch: a.epoch, offset: 0 })); await credit;
     credit = nextMessage(sender, kind('relay-credit')); fast.send(JSON.stringify({ type: 'relay-ack', transferId: b.transferId, epoch: b.epoch, offset: 0 })); await credit;

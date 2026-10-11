@@ -1,6 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { ControlEvent, DownloadRequest, FileInfo, SessionInfo, ShareInfo, UploadAttempt } from '../shared/types';
-import { decodeFrame, ID_PATTERN, SHA256_PATTERN, SINGLE_PUT_MAX_BYTES, urlTtl, validateFrame } from '../shared/protocol';
+import { chooseMultipartPartSize, decodeFrame, ID_PATTERN, SHA256_PATTERN, SINGLE_PUT_MAX_BYTES, urlTtl, validateFrame } from '../shared/protocol';
 import { limits, type Env } from './config';
 import { assert, bearer, budget, constantEqual, digest, errorResponse, HttpError, id, json, readJson, safeCapabilities, token } from './util';
 import { findMultipartUploads, listParts, presign, r2Configured, validateParts } from './r2';
@@ -31,11 +31,20 @@ export class ShareRoom extends DurableObject<Env> {
   private sessions = new Map<string, SessionInfo>();
   private dirty = new Set<string>();
   private relays = new Map<string, Relay>();
+  private relayTimer?: ReturnType<typeof setTimeout>;
   private retired = new Map<string, { ownerId: string; fileId: string; epoch: number; size: number; remaining: number; until: number }>();
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, { ...env, DB: meteredDB(env.DB, env) });
     ctx.blockConcurrencyWhile(async () => {
       this.room = await ctx.storage.get<Room>('room');
+      if (this.room?.uploads.some(attempt => !Object.hasOwn(attempt, 'partSize'))) {
+        // 首次升级 v1 状态时固定当时的分片大小；v1 默认是 64 MiB。
+        const previousPartSize = JSON.parse(env.LIMITS ?? '{}').multipartPartBytes ?? 64 * 1024 ** 2;
+        for (const attempt of this.room.uploads) {
+          if (!Object.hasOwn(attempt, 'partSize')) attempt.partSize = attempt.mode === 'multipart' ? previousPartSize : this.file(attempt.fileId).size;
+        }
+        await ctx.storage.put('room', this.room);
+      }
       const entries = await ctx.storage.list<SessionInfo>({ prefix: 'session:' });
       for (const session of entries.values()) this.sessions.set(session.id, session);
       ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"type":"ping"}', '{"type":"pong"}'));
@@ -96,6 +105,19 @@ export class ShareRoom extends DurableObject<Env> {
     this.send(session.id, { type: 'event', event });
   }
   private both(type: string, request: DownloadRequest, data?: unknown) { this.emit(request.ownerId, type, request, data); this.emit(request.receiverId, type, request, data); }
+  private scheduleRelayDeadline() {
+    clearTimeout(this.relayTimer); this.relayTimer = undefined;
+    if (!this.relays.size) return;
+    const deadline = Math.min(this.state().expiresAt, ...[...this.relays.values()].map(relay => relay.lastAck + limits(this.env).ackTimeoutMs));
+    // 活跃中继不能休眠，否则内存中的 credit / offset 会在大消息到达前丢失。
+    this.relayTimer = setTimeout(() => {
+      this.relayTimer = undefined;
+      void this.ctx.blockConcurrencyWhile(async () => { await this.sweep(); await this.persist(); }).catch(error => {
+        console.error(JSON.stringify({ type: 'relay-deadline', message: error instanceof Error ? error.message : 'unknown' }));
+        this.scheduleRelayDeadline();
+      });
+    }, Math.max(1000, deadline - Date.now()));
+  }
   private async persist() {
     if (this.room) await this.ctx.storage.put('room', this.room);
     const updates: Record<string, SessionInfo> = {};
@@ -103,6 +125,7 @@ export class ShareRoom extends DurableObject<Env> {
     if (Object.keys(updates).length) await this.ctx.storage.put(updates);
     this.dirty.clear();
     await this.schedule();
+    this.scheduleRelayDeadline();
   }
   private async schedule() {
     if (!this.room) return;
@@ -143,6 +166,7 @@ export class ShareRoom extends DurableObject<Env> {
     const relay = this.relays.get(task.transferId);
     if (relay) {
       this.relays.delete(task.transferId);
+      this.scheduleRelayDeadline();
       if (task.reservationId) await budget(this.env, '/settle', { id: task.reservationId, bytes: relay.bytes, messages: relay.messages });
       console.log(JSON.stringify({ type: 'ws-relay', requestId: task.id, bytes: relay.bytes, messages: relay.messages, durationMs: Date.now() - task.createdAt, reason: task.error ?? task.status }));
     } else if (task.mode === 'ws' && task.reservationId) await budget(this.env, '/settle', { id: task.reservationId });
@@ -295,7 +319,7 @@ export class ShareRoom extends DurableObject<Env> {
       assert(this.state().uploads.length < 128, 429, 'upload_attempt_limit', '此分享的上传重试次数已达上限');
       const attemptId = id(), key = `temporary/${this.state().id}/${file.id}/${attemptId}`, reservationId = `r2:${attemptId}`;
       await budget(this.env, '/reserve', { id: reservationId, kind: 'r2', bytes: file.size, expiresAt: this.state().expiresAt + conf.lateCleanupGraceMs });
-      attempt = { id: attemptId, fileId, ownerSessionId: session.id, mode: file.size <= SINGLE_PUT_MAX_BYTES ? 'put' : 'multipart', key, createdAt: Date.now(), status: 'uploading', signedUntil: 0, recheckUntil: this.state().expiresAt + conf.lateCleanupGraceMs, reservationId };
+      attempt = { id: attemptId, fileId, ownerSessionId: session.id, mode: file.size <= SINGLE_PUT_MAX_BYTES ? 'put' : 'multipart', partSize: file.size <= SINGLE_PUT_MAX_BYTES ? file.size : chooseMultipartPartSize(file.size, conf.multipartPartBytes), key, createdAt: Date.now(), status: 'uploading', signedUntil: 0, recheckUntil: this.state().expiresAt + conf.lateCleanupGraceMs, reservationId };
       // 必须在产生 R2 对象/会话之前登记对象 key 与预算。
       try {
         await this.env.DB.prepare('INSERT INTO upload_attempts (id, file_id, share_id, owner_session_id, mode, r2_key, created_at, status, recheck_until, reservation_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(attempt.id, file.id, this.state().id, session.id, attempt.mode, key, attempt.createdAt, 'uploading', attempt.recheckUntil, reservationId).run();
@@ -312,12 +336,12 @@ export class ShareRoom extends DurableObject<Env> {
       await budget(this.env, '/r2-operation', { kind: 'A' });
       const auth = await presign(this.env, attempt.key, 'PUT', this.state().expiresAt, { mime: file.mime, size: file.size });
       attempt.signedUntil = Math.max(attempt.signedUntil, auth.signedUntil); await this.updateAttempt(attempt);
-      return json({ attemptId: attempt.id, mode: attempt.mode, url: auth.url, headers: auth.headers, partSize: conf.multipartPartBytes, uploadedParts: [] });
+      return json({ attemptId: attempt.id, mode: attempt.mode, url: auth.url, headers: auth.headers, partSize: attempt.partSize, uploadedParts: [] });
     }
     assert(attempt.uploadId, 409, 'multipart_initializing', 'Multipart 会话尚未初始化，请重试');
-    const parts = await listParts(this.env, attempt.key, attempt.uploadId); validateParts(parts, file.size, conf.multipartPartBytes, false);
+    const parts = await listParts(this.env, attempt.key, attempt.uploadId); validateParts(parts, file.size, attempt.partSize, false);
     await this.updateAttempt(attempt);
-    return json({ attemptId: attempt.id, mode: 'multipart', partSize: conf.multipartPartBytes, uploadedParts: parts });
+    return json({ attemptId: attempt.id, mode: 'multipart', partSize: attempt.partSize, uploadedParts: parts });
   }
   private uploadAttempt(fileId: string, attemptId: unknown) {
     const attempt = this.state().uploads.find(x => x.id === attemptId && x.fileId === fileId);
@@ -332,7 +356,7 @@ export class ShareRoom extends DurableObject<Env> {
     assert(attempt.status === 'uploading', 409, 'upload_canceled', '此上传已取消或暂停');
     assert(!file.sha256 || file.sha256 === sha256, 409, 'source_changed', '源文件内容与原分享不一致');
     if (attempt.mode === 'multipart') {
-      const parts = await listParts(this.env, attempt.key, attempt.uploadId!); validateParts(parts, file.size, limits(this.env).multipartPartBytes, true);
+      const parts = await listParts(this.env, attempt.key, attempt.uploadId!); validateParts(parts, file.size, attempt.partSize, true);
       await budget(this.env, '/r2-operation', { kind: 'A' });
       await this.env.BUCKET.resumeMultipartUpload(attempt.key, attempt.uploadId!).complete(parts.map(x => ({ partNumber: x.partNumber, etag: x.etag })));
     }
@@ -395,6 +419,7 @@ export class ShareRoom extends DurableObject<Env> {
     assert(typeof offset === 'number' && Number.isSafeInteger(offset) && offset >= relay.acked && offset <= relay.sent, 400, 'invalid_ack', 'ACK 偏移超出已转发范围');
     assert(offset > relay.acked || !relay.ready, 409, 'duplicate_ack', '重复 ACK');
     relay.acked = offset; relay.ready = true; relay.lastAck = Date.now(); relay.messages++;
+    this.scheduleRelayDeadline();
     this.send(task.ownerId!, { type: 'relay-credit', transferId: task.transferId, epoch: task.epoch, offset, window: limits(this.env).windowBytes });
   }
   private async relayData(session: SessionInfo, message: ArrayBuffer) {
@@ -527,12 +552,12 @@ export class ShareRoom extends DurableObject<Env> {
             assert(attempt.mode !== 'multipart' || (session && attempt.verifiedSessionId === session.id), 409, 'source_identity_required', 'Multipart 必须先验证当前会话的完整源文件身份');
             const result = await this.completeUpload(fileId, data.attemptId, data.sha256); await this.persist(); return result;
           }
-          const attempt = this.uploadAttempt(fileId, data.attemptId), partNumber = Number(fileRoute[3]), file = this.file(fileId), conf = limits(this.env);
+          const attempt = this.uploadAttempt(fileId, data.attemptId), partNumber = Number(fileRoute[3]), file = this.file(fileId);
           assert(attempt.mode === 'multipart' && attempt.uploadId && attempt.status === 'uploading' && this.state().requests.some(x => x.fileId === fileId && active(x) && x.mode === 'r2'), 409, 'upload_paused', 'Multipart 已暂停或取消');
           assert(session && file.sha256 && attempt.verifiedSessionId === session.id, 409, 'source_identity_required', '签发分片前必须验证当前会话的完整源文件 SHA-256');
-          assert(Number.isInteger(partNumber) && partNumber >= 1 && partNumber <= Math.ceil(file.size / conf.multipartPartBytes), 400, 'invalid_part', '分片编号无效');
+          assert(Number.isInteger(partNumber) && partNumber >= 1 && partNumber <= Math.ceil(file.size / attempt.partSize), 400, 'invalid_part', '分片编号无效');
           await budget(this.env, '/r2-operation', { kind: 'A' });
-          const auth = await presign(this.env, attempt.key, 'PUT', this.state().expiresAt, { mime: file.mime, size: Math.min(conf.multipartPartBytes, file.size - (partNumber - 1) * conf.multipartPartBytes), uploadId: attempt.uploadId, partNumber });
+          const auth = await presign(this.env, attempt.key, 'PUT', this.state().expiresAt, { mime: file.mime, size: Math.min(attempt.partSize, file.size - (partNumber - 1) * attempt.partSize), uploadId: attempt.uploadId, partNumber });
           attempt.signedUntil = Math.max(attempt.signedUntil, auth.signedUntil); await this.updateAttempt(attempt); await this.persist(); return json(auth);
         }
         throw new HttpError(404, 'not_found', '接口不存在');

@@ -2,7 +2,7 @@
 
 匿名临时文件分享服务。浏览器优先通过 WebRTC 直连；失败后由服务端按 **P2P → TURN → WS 中继 → R2** 的顺序授权回退。Workers 提供页面和控制 API，SQLite Durable Objects 协调会话、流控与预算，D1 保存元数据，私有 R2 桶保存临时文件。
 
-在线地址：[临时传](https://cloudflare-file-share.9420.workers.dev)。源码：[GitHub 公开仓库](https://github.com/snakexgc/cloudflare_file_share)。
+在线地址：[临时传](https://share.snakexgc.com)（[workers.dev 入口](https://cloudflare-file-share.9420.workers.dev)）。源码：[GitHub 公开仓库](https://github.com/snakexgc/cloudflare_file_share)。
 
 项目使用 Wrangler 部署到 Cloudflare。未配置机密变量时，分享页面、P2P 信令与 WS 中继仍可运行；R2 直传和 TURN 需要补齐下文对应的机密变量。已完成的测试与待验证项目见 [验收记录](docs/validation.md)。
 
@@ -76,9 +76,19 @@ npx wrangler secret put ADMIN_TOKEN
 }
 ```
 
-默认单文件 10 GiB、单分享 20 GiB、最多 32 个文件。WS 单文件默认 512 MiB、实际数据块 256 KiB、每任务在途窗口 1 MiB、每房间总窗口 8 MiB；RTC 数据块 32 KiB。协议头计入完整 WS 消息的 33,554,432 字节硬上限。
+默认单文件 10 GiB、单分享 20 GiB、最多 32 个文件。WS 单文件默认最多 512 MiB，这是本项目的中继准入配置。Cloudflare 的 **32 MiB 限制作用于单条完整 WS 消息**，可以通过多条消息传输更大的完整文件；本项目每条消息有 52 字节协议头，并额外预留 1 KiB 链路余量，因此 `chunkBytes` 默认 **33,553,356 字节**，编码后的完整消息为 33,553,408 字节（32 MiB 减 1 KiB）。该余量来自云端实测：恰好达到 32 MiB 的消息在当前链路超时，预留 1 KiB 后连续大消息传输通过；它不是 Cloudflare 另行规定的上限。[DO 官方限制](https://developers.cloudflare.com/durable-objects/platform/limits/)
 
-默认 R2 保留/已用预算共 8,000,000,000 字节，最多 16 个未完成上传。ready 对象继续占存储预算，释放上传并发。单次 PUT 的精确上限为 `5 * 1024 ** 3 - 5 * 1024 ** 2`（5,363,466,240 字节）；不超上限只发一次整文件 PUT。超过上限才创建 Multipart，默认 64 MiB parts、串行直传、由服务端查询真实 parts 并合并。**Multipart 签发分片前先增量核对完整源 SHA-256，恢复会话也必须重新确认源文件身份。**
+WS 每任务窗口默认一块载荷，收到实际写入 ACK 后再发送下一块；每房间在途数据预算最多 64 MiB，默认最多同时准入两个 WS 文件任务，避免扩大块后同时扩大内存占用。ACK 超时默认 5 分钟，给慢网络传输大消息留出时间；存在尚未 ACK 的文件消息时改走 HTTPS 心跳，即使 `bufferedAmount` 已清空也维持源会话租约。断连、到期仍会提前终止。RTC 保持独立的 32 KiB 数据块和 1 MiB 窗口，并受协商的 SCTP `maxMessageSize` 约束，不套用 WS 的大消息窗口。
+
+活跃 WS 中继设置 ACK 截止时间定时器，阻止 DO 在大消息尚未完整到达时休眠、丢失内存中的流控窗口；该阶段按活动时长计费。最后一个中继完成、取消或超时后清除定时器，空闲信令仍可休眠。意外重启继续拒绝旧窗口并由客户端重新同步或回退。[DO 生命周期与休眠规则](https://developers.cloudflare.com/durable-objects/concepts/durable-object-lifecycle/)
+
+默认 R2 保留/已用预算共 8,000,000,000 字节，最多 16 个未完成上传。ready 对象继续占存储预算，释放上传并发。单次 PUT 的精确上限为 `5 * 1024 ** 3 - 5 * 1024 ** 2`（5,363,466,240 字节）；不超上限只发一次整文件 PUT。这个请求上限也适用于 Multipart 的单片请求。[R2 官方限制及脚注](https://developers.cloudflare.com/r2/platform/limits/)
+
+超过上限才创建 Multipart，`multipartPartBytes` 默认使用上述精确上限，表示每片的最大目标大小。创建时按最少分片数均衡划分：8,000,000,000 字节的文件分为两片，每片 4,000,000,000 字节，替代原来的 120 个 64 MiB 分片。所有非末片大小相同且至少 5 MiB，最后一片可以更小，总数不超过 10,000。选定的 `partSize` 保存在上传尝试的 DO 状态中，恢复、签名及完成校验均使用同一值，配置调整或 DO 重启不会改变已经开始的 Multipart 边界。[Multipart 官方规则](https://developers.cloudflare.com/r2/objects/upload-objects/#part-size-limits)
+
+Multipart 仍串行浏览器直传，由服务端查询真实 parts 并合并。**签发分片前先增量核对完整源 SHA-256，恢复会话也必须重新确认源文件身份。** `hashChunkBytes` 独立设为 8 MiB；增量哈希和下载流写入的内存块不等于 R2 上传分片，不产生额外上传请求。数 GiB 的分片直接以 `File.slice()` 得到的 Blob 作为请求体，不读成数 GiB 的 ArrayBuffer。
+
+首次升级旧版本已存在的 Multipart 会话时，DO 会将旧配置的分片大小（旧默认 64 MiB）补入持久化状态；这些上传沿原边界完成，新创建的上传使用大分片策略。
 
 还可配置来源/IP 速率、活动分享数、会话数、下载并发、TURN 月预算/安全余量/凭证 TTL、WS 月字节/消息预算、R2 Class A/B 操作预算、轮询频率、控制队列容量与 TTL、在线租约和清理宽限。默认业务请求 25,000/UTC 日、保守 DO 请求 40,000/UTC 日、D1 实际扫描行 3,000,000/日及写入行 80,000/日。D1 使用量来自执行结果的 `rows_read`/`rows_written`；达到阈值后拒绝新业务，已登记的删除仍继续。
 
@@ -139,6 +149,8 @@ npm run test:browser
 ```
 
 打开 `http://127.0.0.1:5175` 点击各项测试。当前浏览器禁用了 WebRTC 构造器时直连项目会明确 SKIP，不能把 WS 回退成功当作 WebRTC 成功。测试会撤销自己的分享并清除生成的 OPFS 文件。
+
+“WS 大消息与尾片”生成 67,106,729 字节数据，检查实际发送的完整消息大小为 33,553,408、33,553,408、69 字节，并在写入 OPFS 后重新读取、校验 SHA-256。该测试使用默认 WS 分片配置；协议单元测试另行验证 32 MiB 硬上限的包含与越界边界。
 
 本地 Wrangler 不自动运行 Cron。可手动触发：
 

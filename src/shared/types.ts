@@ -64,6 +64,7 @@ export interface UploadAttempt {
   fileId: string;
   ownerSessionId: string;
   mode: 'put' | 'multipart';
+  partSize: number;
   key: string;
   uploadId?: string;
   createdAt: number;

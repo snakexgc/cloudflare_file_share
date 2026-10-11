@@ -2,7 +2,7 @@
   "rules": [
     {
       "allowed": {
-        "origins": ["https://cloudflare-file-share.9420.workers.dev"],
+        "origins": ["https://share.snakexgc.com", "https://cloudflare-file-share.9420.workers.dev"],
         "methods": ["GET", "HEAD", "PUT"],
         "headers": ["Content-Type", "Range"]
       },

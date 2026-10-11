@@ -221,7 +221,7 @@ async function restoreSources(files: File[]) {
   for (const registered of share!.files) {
     const file = files.find(candidate => !used.has(candidate) && candidate.name === registered.name && candidate.size === registered.size && candidate.lastModified === registered.lastModified);
     if (!file) continue; used.add(file);
-    if (registered.sha256 && bytesToHex((await hashFile(file, config.limits.chunkBytes)).digest()) !== registered.sha256) { error(`${file.name} 内容与原文件不同，无法恢复此分享`); continue; }
+    if (registered.sha256 && bytesToHex((await hashFile(file, config.limits.hashChunkBytes)).digest()) !== registered.sha256) { error(`${file.name} 内容与原文件不同，无法恢复此分享`); continue; }
     sources.set(registered.id, file);
   }
   if (control) { control.capabilities.readable = [...sources.keys()]; await control.heartbeat(); } else await startControl();

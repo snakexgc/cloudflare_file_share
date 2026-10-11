@@ -1,6 +1,6 @@
 import type { ShareRoom } from './room';
 import type { TURNBudget } from './budget';
-import { FRAME_HEADER_BYTES, SINGLE_PUT_MAX_BYTES, WS_MAX_MESSAGE_BYTES } from '../shared/protocol';
+import { FRAME_HEADER_BYTES, MULTIPART_MAX_PARTS, MULTIPART_MIN_PART_BYTES, SINGLE_PUT_MAX_BYTES, WS_DEFAULT_PAYLOAD_BYTES, WS_MAX_MESSAGE_BYTES } from '../shared/protocol';
 
 export interface Env {
   DB: D1Database;
@@ -43,11 +43,13 @@ export const defaults = {
   pollMinMs: 2000,
   wsHandshakeMs: 5000,
   connectTimeoutMs: 12000,
-  ackTimeoutMs: 20000,
-  chunkBytes: 256 * 1024,
+  ackTimeoutMs: 300000,
+  chunkBytes: WS_DEFAULT_PAYLOAD_BYTES,
   rtcChunkBytes: 32 * 1024,
-  windowBytes: 1024 * 1024,
-  roomBufferBytes: 8 * 1024 * 1024,
+  hashChunkBytes: 8 * 1024 * 1024,
+  windowBytes: WS_DEFAULT_PAYLOAD_BYTES,
+  rtcWindowBytes: 1024 * 1024,
+  roomBufferBytes: 64 * 1024 * 1024,
   memoryDownloadBytes: 32 * 1024 * 1024,
   wsEnabled: true,
   wsMaxFileBytes: 512 * 1024 * 1024,
@@ -69,7 +71,7 @@ export const defaults = {
   r2ClassBMonthly: 8000000,
   uploadUrlSeconds: 300,
   downloadUrlSeconds: 60,
-  multipartPartBytes: 64 * 1024 * 1024,
+  multipartPartBytes: SINGLE_PUT_MAX_BYTES,
   multipartPauseMs: 300000,
   lateCleanupGraceMs: 3600000,
   tombstoneMs: 86400000,
@@ -87,7 +89,7 @@ export function limits(env: Pick<Env, 'LIMITS'>): Limits {
     } else if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < (['turnSafetyBytes', 'turnExternalReserveBytes'].includes(key) ? 0 : 1)) throw new Error(`${key} 必须是有效整数`);
     Object.assign(result, { [key]: value });
   }
-  if (result.chunkBytes + FRAME_HEADER_BYTES > WS_MAX_MESSAGE_BYTES || result.chunkBytes > result.windowBytes || result.windowBytes > result.roomBufferBytes || result.rtcChunkBytes + FRAME_HEADER_BYTES > 65536) throw new Error('数据块、窗口与缓冲配置不一致');
-  if (result.multipartPartBytes < 5 * 1024 ** 2 || result.multipartPartBytes > SINGLE_PUT_MAX_BYTES || result.maxFileBytes > 10000 * result.multipartPartBytes) throw new Error('Multipart 参数超出 R2 限制');
+  if (result.chunkBytes + FRAME_HEADER_BYTES > WS_MAX_MESSAGE_BYTES || result.chunkBytes > result.windowBytes || result.windowBytes > result.roomBufferBytes || result.roomBufferBytes > 64 * 1024 ** 2 || result.rtcChunkBytes + FRAME_HEADER_BYTES > 65536 || result.rtcChunkBytes > result.rtcWindowBytes || result.rtcWindowBytes > 32 * 1024 ** 2 || result.hashChunkBytes > 32 * 1024 ** 2) throw new Error('数据块、窗口与缓冲配置不一致');
+  if (result.multipartPartBytes < MULTIPART_MIN_PART_BYTES || result.multipartPartBytes > SINGLE_PUT_MAX_BYTES || result.maxFileBytes > MULTIPART_MAX_PARTS * result.multipartPartBytes) throw new Error('Multipart 参数超出 R2 限制');
   return result;
 }

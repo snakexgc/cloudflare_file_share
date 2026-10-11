@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { decodeFrame, encodeFrame, FRAME_HEADER_BYTES, SINGLE_PUT_MAX_BYTES, urlTtl, validHours, validateFrame, WS_MAX_MESSAGE_BYTES } from '../src/shared/protocol';
-import { VerifiedSink, type FileWriter } from '../src/client/sink';
+import { chooseMultipartPartSize, decodeFrame, encodeFrame, FRAME_HEADER_BYTES, MULTIPART_MIN_PART_BYTES, SINGLE_PUT_MAX_BYTES, urlTtl, validHours, validateFrame, WS_DEFAULT_PAYLOAD_BYTES, WS_MAX_MESSAGE_BYTES } from '../src/shared/protocol';
+import { hashFile, VerifiedSink, type FileWriter } from '../src/client/sink';
+import { ControlSession } from '../src/client/control';
 import { findMultipartUploads, validateParts } from '../src/worker/r2';
 import { env } from 'cloudflare:workers';
 import { vi } from 'vitest';
@@ -53,6 +54,59 @@ describe('完整文件协议', () => {
   });
   it('R2 单次 PUT 按精确字节边界决定，预签名不越过原到期时间', () => {
     expect(SINGLE_PUT_MAX_BYTES).toBe(5363466240); expect(() => urlTtl(1999, 300, 1000)).toThrow();
+  });
+  it.each([[SINGLE_PUT_MAX_BYTES + 1, 2681733121, 2], [8000000000, 4000000000, 2], [10 * 1024 ** 3, 3579139414, 3]])('Multipart 用最少的大分片传输 %s 字节，不制造极小尾片', (size, expectedPartSize, expectedCount) => {
+    const partSize = chooseMultipartPartSize(size, SINGLE_PUT_MAX_BYTES), count = Math.ceil(size / partSize);
+    expect(count).toBe(expectedCount); expect(partSize).toBe(expectedPartSize);
+    expect(partSize).toBeLessThanOrEqual(SINGLE_PUT_MAX_BYTES);
+    expect(partSize).toBeGreaterThanOrEqual(MULTIPART_MIN_PART_BYTES);
+    expect(size - partSize * (count - 1)).toBeGreaterThanOrEqual(MULTIPART_MIN_PART_BYTES);
+    expect(partSize - (size - partSize * (count - 1))).toBeLessThan(count);
+  });
+  it('自定义最小分片时保留 5 MiB 非末片，拒绝请求上限和数量越界', () => {
+    expect(chooseMultipartPartSize(SINGLE_PUT_MAX_BYTES + 1, MULTIPART_MIN_PART_BYTES)).toBe(MULTIPART_MIN_PART_BYTES);
+    for (const cap of [MULTIPART_MIN_PART_BYTES - 1, SINGLE_PUT_MAX_BYTES + 1]) expect(() => chooseMultipartPartSize(SINGLE_PUT_MAX_BYTES + 1, cap)).toThrow();
+    expect(() => chooseMultipartPartSize(SINGLE_PUT_MAX_BYTES * 10000 + 1, SINGLE_PUT_MAX_BYTES)).toThrow();
+  });
+  it('数 GiB 的源文件哈希只读取 8 MiB 内存块，取消后不继续读取', async () => {
+    const conf = limits({}), controller = new AbortController(), reads: number[] = [];
+    const source = { size: SINGLE_PUT_MAX_BYTES + 1, slice(start: number, end: number) {
+      reads.push(end - start); return { async arrayBuffer() { controller.abort(new Error('test canceled')); return new ArrayBuffer(end - start); } };
+    } } as Blob;
+    await expect(hashFile(source, conf.hashChunkBytes, controller.signal)).rejects.toThrow('test canceled');
+    expect(reads).toEqual([8 * 1024 ** 2]);
+  });
+  it('WS 默认完整消息预留 1 KiB 余量，RTC 和哈希保留独立缓冲', () => {
+    const conf = limits({});
+    expect(conf.chunkBytes).toBe(WS_DEFAULT_PAYLOAD_BYTES);
+    expect(conf.chunkBytes + FRAME_HEADER_BYTES).toBe(WS_MAX_MESSAGE_BYTES - 1024);
+    expect(conf.windowBytes).toBe(conf.chunkBytes);
+    expect(conf.rtcWindowBytes).toBe(1024 ** 2);
+    expect(conf.hashChunkBytes).toBe(8 * 1024 ** 2);
+    expect(() => limits({ LIMITS: JSON.stringify({ roomBufferBytes: 128 * 1024 ** 2 }) })).toThrow();
+  });
+  it('大 WS 消息排队时经 HTTPS 发送心跳，并保留真实 WS 能力', async () => {
+    const control = new ControlSession('a'.repeat(32), 'owner', { ws: true, webrtc: false, readable: [identity.fileId] }, limits({}));
+    control.sessionToken = 'b'.repeat(64);
+    const send = vi.fn(); control.socket = { readyState: WebSocket.OPEN, bufferedAmount: WS_MAX_MESSAGE_BYTES, send } as unknown as WebSocket;
+    vi.mocked(fetch).mockResolvedValue(Response.json({ share: {} }));
+    await control.heartbeat();
+    const [path, request] = vi.mocked(fetch).mock.calls[0];
+    expect(path).toBe(`${control.base}/heartbeat`); expect(request!.method).toBe('POST');
+    expect(JSON.parse(request!.body as string).capabilities).toEqual({ ws: true, webrtc: false, readable: [identity.fileId] });
+    expect(send).not.toHaveBeenCalled();
+  });
+  it('空闲 WS 继续发送 WS 心跳，无需额外 HTTPS 请求', async () => {
+    const control = new ControlSession('a'.repeat(32), 'receiver', { ws: true, webrtc: false, readable: [] }, limits({}));
+    const send = vi.fn(); control.socket = { readyState: WebSocket.OPEN, bufferedAmount: 0, send } as unknown as WebSocket;
+    await control.heartbeat(); expect(send).toHaveBeenCalledOnce(); expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+  it('发送缓冲清空不代表文件消息已被接收，未收到 ACK 时仍经 HTTPS 保持租约', async () => {
+    const control = new ControlSession('a'.repeat(32), 'owner', { ws: true, webrtc: false, readable: [identity.fileId] }, limits({}));
+    const send = vi.fn(); control.socket = { readyState: WebSocket.OPEN, bufferedAmount: 0, send } as unknown as WebSocket;
+    control.binary(encodeFrame({ ...identity, offset: 0, payload: new Uint8Array([1, 2, 3]) })); send.mockClear();
+    vi.mocked(fetch).mockResolvedValue(Response.json({ share: {} }));
+    await control.heartbeat(); expect(vi.mocked(fetch)).toHaveBeenCalledOnce(); expect(send).not.toHaveBeenCalled();
   });
   it('签名仅使用剩余完整秒，拒绝到期授权', () => {
     expect(urlTtl(7200, 300, 1000)).toBe(6); expect(() => urlTtl(1999, 300, 1000)).toThrow();
