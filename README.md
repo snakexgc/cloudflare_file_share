@@ -1,6 +1,6 @@
 # 临时传 · Cloudflare File Share
 
-匿名临时文件分享服务。普通访客按 **P2P → TURN → WS 中继** 授权回退，所有在线路径失败后停止，不自动使用 R2。管理员登录后，其源端分享、其下载任务以及明确指定的文件才可以使用 R2。Workers 提供页面和控制 API，SQLite Durable Objects 协调会话、流控与预算，D1 保存元数据，私有 R2 桶保存临时文件。
+匿名临时文件分享服务。普通访客按 **P2P → TURN → WS → HTTPS 中继** 授权回退，所有在线路径失败后停止，不自动使用 R2。管理员登录后，其源端分享、其下载任务以及明确指定的文件才可以使用 R2。Workers 提供页面和控制 API，SQLite Durable Objects 协调会话、流控与预算，D1 保存元数据，私有 R2 桶保存临时文件。
 
 在线地址：[临时传](https://share.snakexgc.com)（[workers.dev 入口](https://cloudflare-file-share.9420.workers.dev)）。源码：[GitHub 公开仓库](https://github.com/snakexgc/cloudflare_file_share)。
 
@@ -20,7 +20,7 @@ npm run dev
 
 选择文件与 1–24 的整数小时有效期，生成公开链接。管理令牌只在管理页面 URL 的 `#owner=...` 中，请只分享页面显示的公开链接。刷新管理页面后重新选择原文件：核对名称、精确大小、修改时间，以及已经登记的 SHA-256，确认后才能恢复发送。没有首次传输哈希时，只能核对登记的文件元数据。
 
-有效期默认 6 小时，从创建分享开始计算，重连、上传、暂停、恢复与切换模式都不延长。打开页面会自动检测网络、维持在线状态和尝试打洞；点击下载后才传输文件内容。P2P、TURN 和 WS 需要分享者页面可运行并联网；R2 完整对象 ready 后，在有效管理员授权期限内可离线下载。
+有效期默认 6 小时，从创建分享开始计算，重连、上传、暂停、恢复与切换模式都不延长。打开页面会自动检测网络、维持在线状态和尝试打洞；点击下载后才传输文件内容。P2P、TURN、WS 和 HTTPS 需要分享者页面可运行并联网；R2 完整对象 ready 后，在有效管理员授权期限内可离线下载。
 
 ## 管理登录、文件和用量
 
@@ -33,20 +33,20 @@ npm run dev
 - API / DO / D1 当日统计、R2 存储预留与 Class A/B 月度计数、WS 流量、TURN 测量值和预留预算条形图。
 - 全部分享和文件的分页列表、原到期时间、云端与清理状态、房间内在线源端和接收端数量、传输模式。
 - 在线页面会话数和最近心跳；匿名服务没有用户账号，统计口径是页面会话，60 秒内有心跳视为在线。
-- 按文件强制 P2P / TURN / WS / R2，或恢复自动选择；在线接收端从已写入偏移切换，后续下载沿用指定方式。R2 下载会重新下载完整对象。强制方式失败后报告错误，不自动降级，也不被后台 P2P 成功覆盖。
+- 按文件强制 P2P / TURN / WS / HTTPS / R2，或恢复自动选择；在线接收端从已写入偏移切换，后续下载沿用指定方式。R2 下载会重新下载完整对象。强制方式失败后报告错误，不自动降级，也不被后台 P2P 成功覆盖。
 - 删除文件、撤销整个分享、分页列出及删除 `temporary/` 下的 R2 实际对象。删除已登记文件会阻止新下载，取消相关传输、Abort Multipart、删除当前对象，并持续复核迟到 PUT；已签发的 URL 到期前不能单独撤销，因此清理记录和容量预留会保留到复核结束。
 
 管理员登录的分享页面也会出现逐文件传输方式选择器。普通访客不显示 R2 检测项或方式选择器。跨标签页登录/退出后，回到分享页面会更新可见选项；实际 R2 请求仍由服务端检查授权。预算为应用侧账本，不是 Cloudflare 账单或账户支付上限；实际费用请在 Cloudflare 账单页面核对。
 
 ## 自动检测与后台 NAT 打洞
 
-打开网页自动检测 P2P/STUN 候选、TURN 中继候选分配、WS 握手和小消息回显，可点击「快速复测」。管理员还可检测 R2 私有桶访问；该项不会自动上传测试文件，S3 密钥和 CORS 在实际直传时验证。TURN 未启用或未配置时显示原因；TURN 探测受账户预算控制，凭证有效 60 秒、每来源每分钟一次、每次保守预留 1 MiB。候选分配成功不代表尚未在线的接收端可以连通。
+打开网页自动检测 P2P/STUN 候选、TURN 中继候选分配、WS 握手与小消息回显、HTTPS 请求回显，可点击「快速复测」。管理员还可检测 R2 私有桶访问；该项不会自动上传测试文件，S3 密钥和 CORS 在实际直传时验证。TURN 未启用或未配置时显示原因；TURN 探测受账户预算控制，凭证有效 60 秒、每来源每分钟一次、每次保守预留 1 MiB。候选分配成功不代表尚未在线的接收端可以连通。
 
 检测分阶段报告：P2P 先检查当前页面能否创建 WebRTC DataChannel，再收集 ICE 候选；只有与实际对端建立通道后才算直连成功。缺少 `RTCPeerConnection` 或创建被拒绝时，显示「当前页面 API 不可用 / 无法测试」，并可展开查看构造器类型、安全上下文及相关接口，不能据此断定浏览器产品不支持 WebRTC 或 NAT 不可打洞。此检测不请求摄像头或麦克风。
 
 TURN 分别报告缺失变量名称、已配置但开关关闭、统计/签名接口失败、短期凭据签发成功，以及客户端 relay 候选分配情况。即使当前页面不能使用 WebRTC，也可验证服务端配置和凭据签发，显示「服务已验证，当前页面无法测试中继链路」。快速复测在有效期内复用短期探测凭据，触发限速时显示暂缓，不将限速误报为凭据未配置。
 
-两端分享页面在线时，单独的后台 ICE 通道自动交换 host / srflx 等候选并检查连通性，允许 IPv4 和 IPv6，不按地址族过滤候选。一次协商等待最多 45 秒；未打通时每 30 秒检查并重试，传输期间也继续。打通的 DataChannel 保留供后续文件复用。自动模式的 TURN / WS / R2 接收任务会停止旧链路、等待正在写入的数据落盘，然后按已写入偏移、全新 epoch 和 transferId 切换到热 P2P 通道，继续完整 SHA-256 校验；旧链路迟到分片不再写入。没有下载需求时只交换信令，不发送文件内容。
+两端分享页面在线时，单独的后台 ICE 通道自动交换 host / srflx 等候选并检查连通性，允许 IPv4 和 IPv6，不按地址族过滤候选。一次协商等待最多 45 秒；未打通时每 30 秒检查并重试，传输期间也继续。打通的 DataChannel 保留供后续文件复用。自动模式的 TURN / WS / HTTPS / R2 接收任务会停止旧链路、等待正在写入的数据落盘，然后按已写入偏移、全新 epoch 和 transferId 切换到热 P2P 通道，继续完整 SHA-256 校验；旧链路迟到分片不再写入。没有下载需求时只交换信令，不发送文件内容。
 
 **NAT 判定边界：**浏览器 WebRTC API 提供 ICE 候选与连接状态，不开放任意 STUN 属性或原始 UDP。RFC 5780 的精确 NAT 映射/过滤分类需要专门服务器和 `CHANGE-REQUEST` / `OTHER-ADDRESS` 测试，因此纯网页无法可靠宣称「全锥形」「对称 NAT」等类型。页面如实显示候选地址族、公网映射是否取得、实际直连是否打通；mDNS 或隐私策略隐藏地址时显示「地址隐藏」。无法精确分类时仍尝试标准 ICE 打洞，避免错判而放弃可用路径。[WebRTC 标准](https://www.w3.org/TR/webrtc/)、[RFC 5780](https://www.rfc-editor.org/rfc/rfc5780.html)。
 
@@ -93,9 +93,23 @@ npx wrangler secret put ADMIN_TOKEN
 
 `R2_ENDPOINT` 是可选配置，默认 `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`。使用受地域限制的桶时设为对应 S3 endpoint；生产必须 HTTPS。本地受控 S3 测试端点只允许 `http://127.0.0.1` 或 `http://localhost`。`R2_BUCKET_NAME` 和 `LIMITS` 是普通变量，写在 `wrangler.jsonc` 的 `vars` 中，不是秘密。
 
-**TURN Secrets 配齐且 `LIMITS.turnEnabled: true` 才能签发凭据。** 当前仓库的 `wrangler.jsonc` 与示例已显式启用；底层配置默认值仍为 false，使用自己的配置时应核对开关。统计查询失败或过旧时拒绝新 TURN 授权，继续检查 WS；仅有有效管理员授权时才进一步考虑 R2。统计汇总账户所有 TURN Key；账户同时使用 SFU 时，必须通过 `turnExternalReserveBytes` 为 SFU 等共享使用量预留预算。独占账户可以明确设为 0。
+**TURN Secrets 配齐且 `LIMITS.turnEnabled: true` 才能签发凭据。** 当前仓库的 `wrangler.jsonc` 与示例已显式启用；底层配置默认值仍为 false，使用自己的配置时应核对开关。统计查询失败或过旧时拒绝新 TURN 授权，继续检查 WS 和 HTTPS；仅有有效管理员授权时才进一步考虑 R2。统计汇总账户所有 TURN Key；账户同时使用 SFU 时，必须通过 `turnExternalReserveBytes` 为 SFU 等共享使用量预留预算。独占账户可以明确设为 0。
 
 ## 配置与限额
+
+### HTTPS 分块中继
+
+普通访客自动按 P2P → TURN → WS → HTTPS 授权回退，在线路径失败后仅有有效管理员授权才允许 R2。管理员可在分享页或管理台强制指定 HTTPS；强制方式失败后报告错误。HTTPS 默认无需额外 Secrets，完整文件上限为 10 GiB，块大小为 16 MiB，可通过 `httpsEnabled`、`httpsMaxFileBytes`、`httpsChunkBytes`、`httpsMaxConcurrent` 配置。块大小独立于 WS 和 R2 分片，最高 50 MiB，且不能超过房间缓冲。Cloudflare Free/Pro 的普通请求体上限仍为 100 MB，流式读取不绕过这个上限。[Workers 官方限制](https://developers.cloudflare.com/workers/platform/limits/)
+
+分享者以 `File.slice()` 得到的 Blob POST 原始二进制块，服务器验证当前会话、任务、文件、epoch、transferId、偏移与精确长度后暂存在 DO 内存。下载者 GET 完整块、写入同一个目标文件，再 POST ACK；上传 POST 等待这个 ACK 后才返回新的发送偏移并允许下一块。无块时 GET 最多等待 25 秒，返回 204 与 Retry-After；上传和 ACK 使用现有 5 分钟截止时间。POST / ACK 幂等，未确认的块可重新 GET。HTTPS 内容仅在有界内存中中转，元数据持续持久化，完成时仍验证完整字节数与 SHA-256。
+
+每任务只准入一个块窗口；HTTPS 与 WS 共用每房间最多 64 MiB 的预算，同一个运行实例中的 HTTPS 窗口也合计限制为 64 MiB。默认全局最多 32 个 HTTPS 任务，实际并发受上述窗口进一步限制。上传读取及网络等待位于房间串行锁外，因此慢上传不阻塞心跳、取消或其他文件。取消、切换、超时、到期和删除会停止旧请求并释放缓冲。
+
+HTTPS 任务的发现、心跳、事件和完成信令使用 HTTP，即使浏览器没有 WebSocket 或 WebRTC 也可下载。仅 HTTPS 会话跳过 WS 握手和探测，同页面其他文件可保留已有 WS 数据连接。同块网络请求最多重试两次，仍失败或 DO 重启时可按实际写入进度重建一次 HTTPS 任务，使用新的 epoch / transferId；分享者重新扫描源前缀，接收者继续完整文件哈希。文件写入或 SHA-256 校验失败直接终止。大文件保存沿用现有流式文件写入器及浏览器能力要求。
+
+接口为 `/api/shares/:shareId/download-requests/:requestId/https/chunk`（POST 上传、GET 读取）和 `/https/ack`（POST JSON 确认）。chunk 查询参数与 ACK JSON 都携带 `fileId`、`epoch`、`transferId`、`offset`；上传使用 `application/octet-stream`。`/download-requests/:requestId/resume` 验证接收会话、旧 epoch / transferId 和恢复偏移后重建 HTTPS 任务。数据接口使用现有会话 Bearer 令牌，并禁止缓存与跨站调用。
+
+每块通常产生一次上传、一次读取和一次 ACK；重试、25 秒等待结束后的再次读取及控制轮询另计。HTTP 请求按现有 API / DO 日阈值计量，不使用 WS 消息的 20:1 折算。管理台显示已转发字节（包含重读）、在传任务及累计任务活跃时长；并行任务时长相加，因此不是 Cloudflare 账单的房间活跃时长。DO 等待和定时器会产生持续时长计费，结束后停止定时器；此功能没有新增全账户计算时长熔断。[DO 官方计费](https://developers.cloudflare.com/durable-objects/platform/pricing/)
 
 `LIMITS` 是 JSON 字符串，仅接受 [配置定义](src/worker/config.ts) 中的字段；未知字段、错误类型和不一致的块/窗口参数会报错。推荐初始配置见 [examples/limits.json](examples/limits.json)，示例写法：
 
@@ -147,7 +161,7 @@ Multipart 仍串行浏览器直传，由服务端查询真实 parts 并合并。
 
 桌面 Chrome / Edge 优先使用 File System Access API，增量落盘。缺少文件流时只允许默认最多 32 MiB 的有界内存下载，仍输出一个完整文件；显示「已校验，已交给浏览器保存」，不声称已确认操作系统保存完成。更大文件明确提示更换支持流式保存的浏览器。取消或写入失败会 abort；不会输出独立分片文件。
 
-同一页面的 P2P → TURN / WS、后台直连成功后的 TURN / WS / R2 → P2P，均可携带已实际写入的偏移与可信哈希前缀，发送端重新扫描源前缀。切换前先停止旧任务；开始 R2 下载或 R2 网络重试时从头写入并清空旧结果。刷新接收页面后重新下载。DO 重启不持久化 WS 文件数据或 credit，旧窗口被拒绝，重新同步并从可信进度重建；只有有效管理员授权才可回退 R2。单次 PUT 取消后重新上传；Multipart 在受控分片边界暂停，默认宽限 5 分钟且不超过原到期时间。
+同一页面的 P2P → TURN / WS / HTTPS、后台直连成功后的 TURN / WS / HTTPS / R2 → P2P，均可携带已实际写入的偏移与可信哈希前缀，发送端重新扫描源前缀。切换前先停止旧任务；开始 R2 下载或 R2 网络重试时从头写入并清空旧结果。刷新接收页面后重新下载。DO 重启不持久化 WS 文件数据或 credit，旧窗口被拒绝，重新同步并从可信进度重建；只有有效管理员授权才可回退 R2。单次 PUT 取消后重新上传；Multipart 在受控分片边界暂停，默认宽限 5 分钟且不超过原到期时间。
 
 ## 部署到 Cloudflare
 
@@ -199,17 +213,19 @@ npm run test:browser
 
 “WS 大消息与尾片”生成 67,106,729 字节数据，检查实际发送的完整消息大小为 33,553,408、33,553,408、69 字节，并在写入 OPFS 后重新读取、校验 SHA-256。该测试使用默认 WS 分片配置；协议单元测试另行验证 32 MiB 硬上限的包含与越界边界。
 
+“HTTPS 多块”在当前测试页面临时禁用 WebSocket 与 RTCPeerConnection，生成两个默认 16 MiB 块加 17 字节尾片，确认两端控制和文件传输均为 HTTP，再重新读取保存文件核对 SHA-256；测试结束恢复构造器。“HTTPS 零字节”验证空文件。“HTTPS 与 WS 并行”使用同一个分享者的 WS 连接和独立 HTTP 任务，同时保存两个文件并分别重新核对哈希。
+
 本地 Wrangler 不自动运行 Cron。可手动触发：
 
 ```powershell
 Invoke-WebRequest http://127.0.0.1:8787/cdn-cgi/local/scheduled
 ```
 
-预算监控：网页访问 `/admin`；CLI 仍可通过 `GET /api/admin/budget` 与 `Authorization: Bearer <ADMIN_TOKEN>` 查询。网页管理 API 使用 Cookie，包含 `/api/admin/session`、`/login`、`/logout`、`/overview`、`/shares`、`/objects`，公网不能直接调用房间的内部管理路由。返回当日 API/DO/D1、月度 TURN 统计与预留、WS 字节/消息、R2 保留字节与操作次数。日志只记录任务标识、字节、消息、时长与失败原因，不打印密钥或文件内容。
+预算监控：网页访问 `/admin`；CLI 仍可通过 `GET /api/admin/budget` 与 `Authorization: Bearer <ADMIN_TOKEN>` 查询。网页管理 API 使用 Cookie，包含 `/api/admin/session`、`/login`、`/logout`、`/overview`、`/shares`、`/objects`，公网不能直接调用房间的内部管理路由。返回当日 API/DO/D1、月度 TURN 统计与预留、WS 字节/消息、HTTPS 字节/活跃任务/任务时长、R2 保留字节与操作次数。日志只记录任务标识、字节、消息、时长与失败原因，不打印密钥或文件内容。
 
 ## 接口与代码位置
 
-公开查看 `/api/shares/:id`；独立管理权限用于会话、上传与撤销。控制层提供 `/sessions`、`/ws`、`/signals`、`/events?cursor=...`、`/heartbeat`、`/files-status`、`/peers`、`/peer-signals`。下载者通过 `/download-requests` 创建需求；`/download-requests/:requestId/advance` 授权下一阶段，`/upgrade` 只授权双方 ready 的同一后台直连，`/switch` 验证管理员当前指定策略，DELETE 只取消本人任务。TURN 凭证与 WS relay 准入仍由服务端预算判断。
+公开查看 `/api/shares/:id`；独立管理权限用于会话、上传与撤销。控制层提供 `/sessions`、`/ws`、`/signals`、`/events?cursor=...`、`/heartbeat`、`/files-status`、`/peers`、`/peer-signals`。下载者通过 `/download-requests` 创建需求；`/download-requests/:requestId/advance` 授权下一阶段，`/upgrade` 只授权双方 ready 的同一后台直连，`/switch` 验证管理员当前指定策略，DELETE 只取消本人任务。TURN 凭证与 WS / HTTPS relay 准入仍由服务端预算判断。
 
 R2 控制接口为 `/files/:fileId/uploads`、`/identity`、`/parts/:part/sign`、`/complete`、`/abort`、`/failure`、`/download`。`/failure` 在未获得上传授权时也能通知等待者，源文件不可读时进入等待恢复。内部初始化和清理路由仅由 Worker 的 DO binding 调用，公网不转发 `/internal/*`。源代码分别在 `src/worker/`、`src/client/`、`src/shared/`、`web/`，SQL 在 `migrations/`。
 

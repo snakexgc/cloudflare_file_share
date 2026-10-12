@@ -51,16 +51,16 @@ function size(bytes: number) { if (!bytes) return '0 B'; const units = ['B', 'Ki
 function shell(content: string) {
   app.innerHTML = `<header class="header"><a href="/" class="brand"><span class="brand-mark">${icon('arrows')}</span><span>临时传</span></a><span class="header-note">轻一点分享，少一点等待</span><a class="header-link" href="/admin">${config?.admin ? '管理台 · 已登录' : '管理登录'}</a><a href="#how">如何分享 ${icon('link')}</a></header><main>${content}</main><footer><span>文件来去自如，分享有始有终。</span><span>${icon('shield')} 直连优先 · 按时失效 · 原文件交付</span></footer><div id="toast" role="status" aria-live="polite"></div>`;
 }
-function network() { mountProbes(config, () => { peers?.retest(); }); }
+function network() { mountProbes({ ...config, httpOnly: control?.httpOnly || share?.files.some(file => file.forcedMode === 'https') }, () => { peers?.retest(); }); }
 function modes() {
   if (!config.admin || !share) return;
   for (const file of share.files) {
     const parent = document.querySelector(`#file-${file.id}`)!;
     if (parent.querySelector('.mode-choice')) continue;
     const row = document.createElement('div'); row.className = 'mode-choice';
-    row.innerHTML = `<label for="mode-${file.id}">此文件的传输方式</label><select id="mode-${file.id}" aria-label="${escape(file.name)} 的传输方式">${[['auto', '自动选择'], ['p2p', '强制 P2P 直连'], ['turn', '强制 TURN 中继'], ['ws', '强制 WS 中继'], ['r2', '强制 R2 云端']].map(([value, name]) => `<option value="${value}" ${value === (file.forcedMode ?? 'auto') ? 'selected' : ''}>${name}</option>`).join('')}</select><small>指定方式失败后报告错误；传输中从已写入偏移切换</small>`;
+    row.innerHTML = `<label for="mode-${file.id}">此文件的传输方式</label><select id="mode-${file.id}" aria-label="${escape(file.name)} 的传输方式">${[['auto', '自动选择'], ['p2p', '强制 P2P 直连'], ['turn', '强制 TURN 中继'], ['ws', '强制 WS 中继'], ['https', '强制 HTTPS 中继'], ['r2', '强制 R2 云端']].map(([value, name]) => `<option value="${value}" ${value === (file.forcedMode ?? 'auto') ? 'selected' : ''}>${name}</option>`).join('')}</select><small>指定方式失败后报告错误；传输中从已写入偏移切换</small>`;
     parent.insertBefore(row, parent.querySelector('.transfer-info'));
-    if (ownerToken) (row.querySelector('select') as unknown as HTMLSelectElement).onchange = event => { void (async () => { try { await startControl(); await api(`${control!.base}/files/${file.id}/mode`, control!.sessionToken, { mode: (event.target as HTMLSelectElement).value }); toast('已设置此文件传输方式，在线下载者会切换'); } catch (failure) { error(String(failure)); } })(); };
+    if (ownerToken) (row.querySelector('select') as unknown as HTMLSelectElement).onchange = event => { void (async () => { try { const mode = (event.target as HTMLSelectElement).value; await startControl(mode === 'https'); if (mode === 'https') control!.preferHttp([...senders.values()].some(sender => sender.task.mode === 'ws')); if (mode !== 'https') await control!.ensureWs().catch(() => {}); await api(`${control!.base}/files/${file.id}/mode`, control!.sessionToken, { mode }); if (mode === 'https') network(); toast('已设置此文件传输方式，在线下载者会切换'); } catch (failure) { error(String(failure)); } })(); };
     else (row.querySelector('select') as unknown as HTMLSelectElement).onchange = event => { const receiver = [...receivers.values()].find(x => x.task.fileId === file.id && !x.done); if (receiver) void receiver.switchTo((event.target as HTMLSelectElement).value); };
   }
 }
@@ -68,7 +68,7 @@ function toast(message: string) { const element = $('#toast'); element.textConte
 function error(message: string) { const element = $('#error'); element.textContent = message; element.hidden = !message; }
 function fileTile(file: { name: string; size: number }, extra = '') { const ext = file.name.includes('.') ? file.name.split('.').pop()!.slice(0, 5).toUpperCase() : 'FILE'; return `<span class="file-symbol">${escape(ext || 'FILE')}</span><span class="file-description"><strong title="${escape(file.name)}">${escape(file.name)}</strong><small>${size(file.size)}</small></span>${extra}`; }
 function renderHome() {
-  shell(`<section class="hero"><div class="eyebrow"><span class="live-dot"></span> 让文件，直接抵达</div><h1>文件轻轻一传，<br/><span>分享就这么简单。</span></h1><p>无需注册，保留原文件。选择文件，生成链接，<br class="desktop-break"/>让下一次分享少一点麻烦。</p></section><div class="workspace"><section class="card upload-card"><div class="card-heading"><div><h2>创建一次临时分享</h2><p>从你的设备，传到对方的设备。</p></div><span class="step-label">01 / 开始分享</span></div><label class="dropzone" id="dropzone" for="file-input"><span class="upload-orbit">${icon('upload')}</span><strong>把文件拖到这里</strong><span>或点击选择文件 · 支持多文件</span><small id="file-limit">正在读取服务配置…</small><input id="file-input" type="file" multiple aria-label="选择分享文件"/></label><div id="selected-files" class="selected-files"></div><form id="create-form"><div class="expiry-field"><label for="hours">链接有效期<small>从创建分享时开始计时</small></label><div class="number-input"><input id="hours" name="expiresInHours" type="number" min="1" max="24" step="1" value="6" required inputmode="numeric"/><span>小时</span></div></div><div class="expiry-note">${icon('clock')} 最长 24 小时，到期后自动停止授权并清理。</div><div id="challenge"></div><p id="error" class="error-message" role="alert" hidden></p><button id="create" class="button primary wide" type="submit" disabled>生成分享链接 ${icon('arrows')}</button></form><div class="waiting-note">${icon('shield')} 有人点击下载后才开始传输，请保持分享页面打开。</div></section><aside id="how" class="how-panel"><span class="eyebrow">少一点中转，多一点直接</span><h2>一条链接，<br/>让文件找到对方。</h2><ol class="instructions"><li><span>1</span><div><strong>选择你想分享的文件</strong><p>原内容、原名称，每个文件完整交付。</p></div></li><li><span>2</span><div><strong>把链接发给对方</strong><p>复制链接或扫描二维码，无需注册。</p></div></li><li><span>3</span><div><strong>保持页面打开，等待接收</strong><p>下载开始后优先直连，必要时自动中继。</p></div></li></ol><div class="route-note"><div class="route-icons"><span>${icon('file')}</span><i></i><span class="route-middle">${icon('arrows')}</span><i></i><span>${icon('download')}</span></div><strong>能直传，就直接传</strong><p>直连不可用时依次尝试 TURN 和 WS 中继，所有路径都受服务额度限制。</p></div></aside></div>`);
+  shell(`<section class="hero"><div class="eyebrow"><span class="live-dot"></span> 让文件，直接抵达</div><h1>文件轻轻一传，<br/><span>分享就这么简单。</span></h1><p>无需注册，保留原文件。选择文件，生成链接，<br class="desktop-break"/>让下一次分享少一点麻烦。</p></section><div class="workspace"><section class="card upload-card"><div class="card-heading"><div><h2>创建一次临时分享</h2><p>从你的设备，传到对方的设备。</p></div><span class="step-label">01 / 开始分享</span></div><label class="dropzone" id="dropzone" for="file-input"><span class="upload-orbit">${icon('upload')}</span><strong>把文件拖到这里</strong><span>或点击选择文件 · 支持多文件</span><small id="file-limit">正在读取服务配置…</small><input id="file-input" type="file" multiple aria-label="选择分享文件"/></label><div id="selected-files" class="selected-files"></div><form id="create-form"><div class="expiry-field"><label for="hours">链接有效期<small>从创建分享时开始计时</small></label><div class="number-input"><input id="hours" name="expiresInHours" type="number" min="1" max="24" step="1" value="6" required inputmode="numeric"/><span>小时</span></div></div><div class="expiry-note">${icon('clock')} 最长 24 小时，到期后自动停止授权并清理。</div><div id="challenge"></div><p id="error" class="error-message" role="alert" hidden></p><button id="create" class="button primary wide" type="submit" disabled>生成分享链接 ${icon('arrows')}</button></form><div class="waiting-note">${icon('shield')} 有人点击下载后才开始传输，请保持分享页面打开。</div></section><aside id="how" class="how-panel"><span class="eyebrow">少一点中转，多一点直接</span><h2>一条链接，<br/>让文件找到对方。</h2><ol class="instructions"><li><span>1</span><div><strong>选择你想分享的文件</strong><p>原内容、原名称，每个文件完整交付。</p></div></li><li><span>2</span><div><strong>把链接发给对方</strong><p>复制链接或扫描二维码，无需注册。</p></div></li><li><span>3</span><div><strong>保持页面打开，等待接收</strong><p>下载开始后优先直连，必要时自动中继。</p></div></li></ol><div class="route-note"><div class="route-icons"><span>${icon('file')}</span><i></i><span class="route-middle">${icon('arrows')}</span><i></i><span>${icon('download')}</span></div><strong>能直传，就直接传</strong><p>直连不可用时依次尝试 TURN、WS 和 HTTPS 中继，所有路径都受服务额度限制。</p></div></aside></div>`);
   $('#file-input').onchange = () => { addFiles(Array.from($<HTMLInputElement>('#file-input').files ?? [])); $<HTMLInputElement>('#file-input').value = ''; };
   const zone = $('#dropzone'); zone.ondragover = event => { event.preventDefault(); zone.classList.add('dragging'); }; zone.ondragleave = () => zone.classList.remove('dragging');
   zone.ondrop = event => { event.preventDefault(); zone.classList.remove('dragging'); addFiles(Array.from(event.dataTransfer?.files ?? [])); };
@@ -150,20 +150,21 @@ function updateShare(value: ShareInfo) {
 }
 async function refresh() {
   if (!share) return;
-  try { updateShare(await api<ShareInfo>(`/api/shares/${share.id}`)); }
+  try { if (control?.sessionToken && ownerToken) await control.refreshStatus(); else updateShare(await api<ShareInfo>(`/api/shares/${share.id}`)); }
   catch (failure) { if (failure instanceof ApiError && failure.status === 410) { const details = failure.details as { share?: ShareInfo }; if (details?.share) updateShare(details.share); else expire(); } }
 }
 const progress: Progress = (fileId, label, bytes, mode, finished) => {
   if (!document.querySelector(`#file-${fileId}`)) return;
-  $(`#label-${fileId}`).textContent = `${mode ? ({ p2p: '直连', turn: 'TURN', ws: 'WS 中继', r2: '云端' } as Record<string, string>)[mode] + ' · ' : ''}${label}`;
+  $(`#label-${fileId}`).textContent = `${mode ? ({ p2p: '直连', turn: 'TURN', ws: 'WS 中继', https: 'HTTPS 中继', r2: '云端' } as Record<string, string>)[mode] + ' · ' : ''}${label}`;
   $(`#bytes-${fileId}`).textContent = bytes ? size(bytes) : '';
   const bar = $<HTMLProgressElement>(`#progress-${fileId}`); bar.hidden = false; bar.value = finished && !share!.files.find(file => file.id === fileId)!.size ? 1 : bytes;
   const cancel = document.querySelector<HTMLButtonElement>(`.cancel[data-file="${fileId}"]`); if (cancel) cancel.hidden = Boolean(finished) || label.startsWith('未完成');
   if (finished || label.startsWith('未完成')) { const button = document.querySelector<HTMLButtonElement>(`.download[data-file="${fileId}"]`); if (button) { button.disabled = false; button.innerHTML = `${icon('download')} ${finished ? '再次下载' : '重试下载'}`; } }
 };
-async function startControl() {
+async function startControl(httpOnly = share?.files.every(file => file.forcedMode === 'https') ?? false) {
   if (!share || control || ended) return;
-  control = new ControlSession(share.id, ownerToken ? 'owner' : 'receiver', { webrtc: rtcSupport().available, ws: typeof WebSocket === 'function', readable: [...sources.keys()] }, config.limits, ownerToken);
+  control = new ControlSession(share.id, ownerToken ? 'owner' : 'receiver', { webrtc: rtcSupport().available, ws: !httpOnly && typeof WebSocket === 'function', https: true, readable: [...sources.keys()] }, config.limits, ownerToken);
+  if (httpOnly) control.preferHttp();
   peers = new PeerManager(control, config.stunServers, punchStatus);
   peers.onReady = peer => { for (const receiver of receivers.values()) if (!receiver.done && receiver.task.ownerId === peer.ownerId) void receiver.upgrade(peer.id); };
   control.busy = () => [...receivers.values()].some(x => !x.done) || Boolean(share?.activeRequests);
@@ -181,11 +182,12 @@ async function startControl() {
     } else if (data.type === 'ws-disconnected') {
       for (const receiver of receivers.values()) if (!receiver.done && receiver.task.mode === 'ws') void receiver.advance(new Error('WS 中继连接中断'));
     } else if (data.type === 'expired') expire();
-    else if (data.type === 'resync') {
+    else if (data.type === 'resync' || data.type === 'http-tasks') {
       for (const task of data.requests as DownloadRequest[]) {
+        if (ownerToken && terminal(task)) { void handleEvent({ seq: 0, eventId: '', type: task.status, request: task, createdAt: Date.now() }); continue; }
         const receiver = receivers.get(task.id);
-        if (receiver && !receiver.done) { if (task.epoch !== receiver.task.epoch || task.mode === 'r2') void receiver.start(task); else if (task.status === 'connecting' && !receiver.connected) void receiver.advance(new Error('信令历史已失效，重新协商')); }
-        if (ownerToken && !terminal(task) && task.ownerId === control!.sessionId) void handleEvent({ seq: 0, eventId: '', type: task.mode === 'r2' ? 'upload-needed' : 'attempt', request: task, createdAt: Date.now() });
+        if (receiver && !receiver.done) { if (task.epoch !== receiver.task.epoch || task.mode === 'r2' || task.mode === 'https') void receiver.start(task); else if (task.status === 'connecting' && !receiver.connected) void receiver.advance(new Error('信令历史已失效，重新协商')); }
+        if (ownerToken && !terminal(task) && task.ownerId === control!.sessionId && (task.mode !== 'https' || task.status !== 'requested')) void handleEvent({ seq: 0, eventId: '', type: task.mode === 'r2' ? 'upload-needed' : 'attempt', request: task, createdAt: Date.now() });
       }
     } else if (data.type === 'error') error(String(data.message));
   };
@@ -230,8 +232,10 @@ async function download(fileId: string) {
   try {
     // 文件选择器必须在用户点击的同一激活链内调用，先于任何网络等待。
     sink = await chooseSink(file, config.limits.memoryDownloadBytes);
-    await startControl(); if (!control) throw new Error('控制连接尚未就绪，请重新连接');
     const chosen = (document.querySelector(`#mode-${fileId}`) as unknown as HTMLSelectElement | null)?.value;
+    await startControl(chosen === 'https' || file.forcedMode === 'https'); if (!control) throw new Error('控制连接尚未就绪，请重新连接');
+    if (chosen === 'https' || file.forcedMode === 'https') { control.preferHttp([...receivers.values()].some(receiver => !receiver.done && receiver.task.mode === 'ws' && receiver.task.fileId !== fileId)); network(); }
+    else await control.ensureWs().catch(() => {});
     const request = await api<DownloadRequest>(`${control.base}/download-requests`, control.sessionToken, { fileId, ...(config.admin && chosen ? { mode: chosen } : {}) });
     const receiver = new ReceiveTask(request, sink, control, config.limits, config.stunServers, progress, id => peers?.get(id)); receivers.set(request.id, receiver);
     await receiver.start();

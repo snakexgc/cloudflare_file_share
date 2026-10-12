@@ -59,5 +59,5 @@ export async function budget(env: Env, path: string, data: object): Promise<Reco
 }
 export function safeCapabilities(data: unknown, fileIds: string[]) {
   const value = data as Record<string, unknown> | undefined;
-  return { webrtc: value?.webrtc === true, ws: value?.ws === true, readable: Array.isArray(value?.readable) ? value.readable.filter((x): x is string => typeof x === 'string' && fileIds.includes(x)).slice(0, fileIds.length) : [] };
+  return { webrtc: value?.webrtc === true, ws: value?.ws === true, https: value?.https === true, readable: Array.isArray(value?.readable) ? value.readable.filter((x): x is string => typeof x === 'string' && fileIds.includes(x)).slice(0, fileIds.length) : [] };
 }

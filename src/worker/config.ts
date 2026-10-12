@@ -54,6 +54,10 @@ export const defaults = {
   wsEnabled: true,
   wsMaxFileBytes: 512 * 1024 * 1024,
   wsMaxConcurrent: 32,
+  httpsEnabled: true,
+  httpsChunkBytes: 16 * 1024 ** 2,
+  httpsMaxFileBytes: 10 * 1024 ** 3,
+  httpsMaxConcurrent: 32,
   turnEnabled: false,
   turnMonthlyBytes: 950 * 1000 ** 3,
   turnExternalReserveBytes: 0,
@@ -87,6 +91,7 @@ export function limits(env: Pick<Env, 'LIMITS'>): Limits {
     Object.assign(result, { [key]: value });
   }
   if (result.chunkBytes + FRAME_HEADER_BYTES > WS_MAX_MESSAGE_BYTES || result.chunkBytes > result.windowBytes || result.windowBytes > result.roomBufferBytes || result.roomBufferBytes > 64 * 1024 ** 2 || result.rtcChunkBytes + FRAME_HEADER_BYTES > 65536 || result.rtcChunkBytes > result.rtcWindowBytes || result.rtcWindowBytes > 32 * 1024 ** 2 || result.hashChunkBytes > 32 * 1024 ** 2) throw new Error('数据块、窗口与缓冲配置不一致');
+  if (result.httpsChunkBytes > 50 * 1024 ** 2 || result.httpsChunkBytes > result.roomBufferBytes) throw new Error('HTTPS 数据块不得超过 50 MiB 或房间缓冲上限');
   if (result.multipartPartBytes < MULTIPART_MIN_PART_BYTES || result.multipartPartBytes > SINGLE_PUT_MAX_BYTES || result.maxFileBytes > MULTIPART_MAX_PARTS * result.multipartPartBytes) throw new Error('Multipart 参数超出 R2 限制');
   return result;
 }

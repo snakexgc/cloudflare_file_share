@@ -1,4 +1,4 @@
-export type Mode = 'p2p' | 'turn' | 'ws' | 'r2';
+export type Mode = 'p2p' | 'turn' | 'ws' | 'https' | 'r2';
 export type RequestStatus = 'requested' | 'connecting' | 'transferring' | 'completed' | 'canceled' | 'failed';
 export type UploadStatus = 'none' | 'uploading' | 'paused' | 'ready' | 'canceled' | 'failed' | 'aborted';
 export interface FileInfo {
@@ -44,6 +44,9 @@ export interface DownloadRequest {
   forcedMode?: Mode;
   adminGrant?: string;
   peerId?: string;
+  httpsChunkBytes?: number;
+  httpsBytes?: number;
+  httpsStartedAt?: number;
 }
 export interface ControlEvent {
   seq: number;
@@ -53,7 +56,7 @@ export interface ControlEvent {
   data?: unknown;
   createdAt: number;
 }
-export interface Capabilities { webrtc: boolean; ws: boolean; readable: string[] }
+export interface Capabilities { webrtc: boolean; ws: boolean; https?: boolean; readable: string[] }
 export interface SessionInfo {
   id: string;
   tokenHash: string;

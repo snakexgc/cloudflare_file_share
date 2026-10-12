@@ -1,4 +1,4 @@
-import { api } from '../../src/client/api';
+import { api, delay } from '../../src/client/api';
 import { ControlSession } from '../../src/client/control';
 import { VerifiedSink, type FileWriter } from '../../src/client/sink';
 import { ReceiveTask, SendTask } from '../../src/client/transfer';
@@ -19,20 +19,27 @@ async function run(mode: string) {
   let owner: ControlSession | undefined, receiver: ControlSession | undefined, senderTask: SendTask | undefined, receiveTask: ReceiveTask | undefined;
   let shareId = '', ownerToken = '', savedName = '', directory: Directory | undefined;
   let deadline: ReturnType<typeof setTimeout> | undefined, sink: VerifiedSink | undefined;
+  const useHttps = mode.startsWith('https'), mixed = mode === 'https-mixed';
+  const nativeWs = globalThis.WebSocket, nativeRtc = globalThis.RTCPeerConnection;
+  const senders = new Map<string, SendTask>();
+  let discovery: ReturnType<typeof setInterval> | undefined, extraControl: ControlSession | undefined, extraTask: ReceiveTask | undefined, extraName = '';
+  let overlap = false;
   try {
+    if (useHttps && !mixed) { globalThis.WebSocket = undefined as unknown as typeof WebSocket; globalThis.RTCPeerConnection = undefined as unknown as typeof RTCPeerConnection; log('已禁用 WebSocket 和 RTCPeerConnection 构造器'); }
     const support = rtcSupport(); log(`当前页面 RTCPeerConnection 类型：${support.constructorType}；可创建数据连接：${support.available}`);
     if (mode.startsWith('rtc') && !support.available) { log(`SKIP：${support.message}；本次无法验收直连。`); return; }
     const config = await api<{ limits: Limits; stunServers: IceServer[] }>('/api/config');
     if (mode === 'ws-large' && config.limits.chunkBytes !== WS_DEFAULT_PAYLOAD_BYTES) throw new Error('大消息验收需要默认 WS 分片配置');
-    const source = new Uint8Array(mode === 'zero' ? 0 : mode === 'ws-large' ? 2 * WS_DEFAULT_PAYLOAD_BYTES + 17 : 2 * 1024 ** 2 + 17);
+    const source = new Uint8Array(mode === 'zero' || mode === 'https-zero' ? 0 : useHttps ? 2 * config.limits.httpsChunkBytes + 17 : mode === 'ws-large' ? 2 * WS_DEFAULT_PAYLOAD_BYTES + 17 : 2 * 1024 ** 2 + 17);
     for (let i = 0; i < source.length; i++) source[i] = (i * 79 + 53) % 256;
     const file = new File([source], mode === 'zero' ? '空文件.bin' : '浏览器验收.bin', { type: 'application/octet-stream', lastModified: 123 });
     const created = await api<{ id: string; ownerToken: string; files: FileInfo[] }>('/api/shares', undefined, { expiresInHours: 1, files: [{ name: file.name, size: file.size, mime: file.type, lastModified: file.lastModified }] });
     shareId = created.id; ownerToken = created.ownerToken;
     log(`分享已创建：${created.id}；源文件 ${source.length} 字节`);
-    const useRtc = mode.startsWith('rtc'), useWs = mode !== 'rtc-http';
-    owner = new ControlSession(shareId, 'owner', { webrtc: useRtc, ws: useWs, readable: [created.files[0].id] }, config.limits, ownerToken);
-    receiver = new ControlSession(shareId, 'receiver', { webrtc: useRtc, ws: useWs, readable: [] }, config.limits);
+    const useRtc = mode.startsWith('rtc'), useWs = !useHttps && mode !== 'rtc-http';
+    owner = new ControlSession(shareId, 'owner', { webrtc: useRtc, ws: useWs || mixed, https: useHttps, readable: [created.files[0].id] }, config.limits, ownerToken);
+    receiver = new ControlSession(shareId, 'receiver', { webrtc: useRtc, ws: useWs, https: useHttps, readable: [] }, config.limits);
+    if (useHttps && !mixed) { owner.preferHttp(); receiver.preferHttp(); }
     const frameSizes: number[] = [], binary = owner.binary.bind(owner);
     owner.binary = buffer => { frameSizes.push(buffer.byteLength); binary(buffer); };
     owner.busy = receiver.busy = () => true;
@@ -44,17 +51,22 @@ async function run(mode: string) {
     const settled = new Promise<void>(resolve => { serverComplete = resolve; });
     const timedOut = new Promise<void>((_resolve, reject) => { deadline = setTimeout(() => reject(new Error('浏览器传输 90 秒内未完成')), 90000); }); void timedOut.catch(() => {});
     void finished.catch(() => {});
-    owner.onRaw = data => { if (data.type === 'relay-credit') { if (senderTask) senderTask.credit(data); else credits.set(String(data.transferId), data); } else if (data.type === 'error') log(`发送端错误：${JSON.stringify(data)}`); };
+    owner.onRaw = data => {
+      if (data.type === 'relay-credit') { const sender = [...senders.values()].find(item => item.task.transferId === data.transferId); if (sender) sender.credit(data); else credits.set(String(data.transferId), data); }
+      else if (data.type === 'http-tasks' || data.type === 'resync') { for (const task of data.requests as DownloadRequest[]) if (['connecting', 'transferring'].includes(task.status) && task.mode !== 'r2') owner!.onEvent({ seq: 0, eventId: '', type: 'attempt', request: task, createdAt: Date.now() }); }
+      else if (data.type === 'error') log(`发送端错误：${JSON.stringify(data)}`);
+    };
     owner.onEvent = event => {
       if (event.request && ['attempt', 'transport-error', 'relay-error'].includes(event.type)) log(`发送端事件 ${event.type}：${event.request.mode}；${event.request.error ?? ''}`);
       ownerQueue = ownerQueue.then(async () => {
         if (!event.request) return;
         if (event.type === 'attempt' && event.request.mode !== 'r2') {
-          senderTask?.stop(); senderTask = new SendTask(event.request, file, owner!, config.limits, config.stunServers, (_id, label) => { if (label.includes('失败')) log(label); });
+          const old = senders.get(event.request.id); if (old?.task.epoch === event.request.epoch) return; old?.stop();
+          senderTask = new SendTask(event.request, file, owner!, config.limits, config.stunServers, (_id, label) => { if (label.includes('失败')) log(label); }); senders.set(event.request.id, senderTask);
           const credit = credits.get(event.request.transferId); if (credit) senderTask.credit(credit);
           void senderTask.start();
-        } else if (event.type === 'rtc-answer' || event.type === 'rtc-ice') await senderTask?.event(event);
-        else if (event.type === 'stop-attempt' || event.type === 'canceled' || event.type === 'completed') senderTask?.stop();
+        } else if (event.type === 'rtc-answer' || event.type === 'rtc-ice') await senders.get(event.request.id)?.event(event);
+        else if (event.type === 'stop-attempt' || event.type === 'canceled' || event.type === 'completed') senders.get(event.request.id)?.stop();
       }).catch(error => failed(error));
     };
     receiver.onEvent = event => {
@@ -66,6 +78,7 @@ async function run(mode: string) {
     receiver.onBinary = buffer => receiveTask?.frame(buffer);
     receiver.onRaw = data => { if (data.type === 'error') log(`接收端错误：${JSON.stringify(data)}`); };
     await owner.start(); await receiver.start();
+    if (mixed) discovery = setInterval(() => { void owner!.refreshStatus().catch(failed); }, 1200);
     directory = await (navigator.storage as unknown as { getDirectory(): Promise<Directory> }).getDirectory();
     savedName = `qa-${created.id}.bin`; const handle = await directory.getFileHandle(savedName, { create: true });
     sink = new VerifiedSink(created.files[0], await handle.createWritable());
@@ -77,21 +90,42 @@ async function run(mode: string) {
       else if (label.includes('切换') || label.includes('连接')) log(`${actualMode}：${label}`);
     });
     await receiveTask.start(); for (const event of queue) await receiveTask.event(event);
-    await Promise.race([Promise.all([finished, settled]), timedOut]); clearTimeout(deadline);
+    const extraFinished: Promise<void>[] = [];
+    if (mixed) {
+      extraControl = new ControlSession(shareId, 'receiver', { ws: true, webrtc: false, https: false, readable: [] }, config.limits); extraControl.busy = () => true;
+      const pending: ControlEvent[] = []; let serial = Promise.resolve(), localDone!: () => void, serverDone!: () => void;
+      extraFinished.push(new Promise<void>(resolve => { localDone = resolve; }), new Promise<void>(resolve => { serverDone = resolve; }));
+      extraControl.onBinary = data => extraTask?.frame(data);
+      extraControl.onEvent = event => { if (event.type === 'completed') serverDone(); if (!extraTask) pending.push(event); else serial = serial.then(() => extraTask!.event(event)).catch(failed); };
+      await extraControl.start(); extraName = `qa-ws-${created.id}.bin`; const extraHandle = await directory.getFileHandle(extraName, { create: true }), writer = await extraHandle.createWritable();
+      const slow: FileWriter = { write: async bytes => { await delay(3500); await writer.write(bytes); }, truncate: size => writer.truncate(size), seek: offset => writer.seek(offset), close: () => writer.close(), abort: () => writer.abort() };
+      const wsTask = await api<DownloadRequest>(`${extraControl.base}/download-requests`, extraControl.sessionToken, { fileId: created.files[0].id });
+      if (wsTask.mode !== 'ws') throw new Error(`混合测试的第二任务必须为 WS，实际 ${wsTask.mode}`);
+      extraTask = new ReceiveTask(wsTask, new VerifiedSink(created.files[0], slow), extraControl, config.limits, config.stunServers, (_id, label, _bytes, actualMode, done) => { if (done) { if (actualMode !== 'ws') failed(new Error('WS 任务被 HTTPS 中断')); localDone(); } else if (label.startsWith('未完成')) failed(new Error(label)); });
+      await extraTask.start(); for (const event of pending) await extraTask.event(event);
+      const status = await api<{ requests: DownloadRequest[] }>(`${owner.base}/files-status`, owner.sessionToken);
+      overlap = status.requests.some(item => item.mode === 'ws' && !['completed', 'canceled', 'failed'].includes(item.status)) && status.requests.some(item => item.mode === 'https' && !['completed', 'canceled', 'failed'].includes(item.status));
+      log(`HTTPS 与 WS 活跃任务同时存在：${overlap}`);
+    }
+    await Promise.race([Promise.all([finished, settled, ...extraFinished]), timedOut]); clearTimeout(deadline);
     if (mode.startsWith('rtc') && receiveTask.task.mode !== 'p2p') throw new Error(`原定 WebRTC 传输回退到了 ${receiveTask.task.mode}；不能视为直连通过`);
+    if (useHttps && receiveTask.task.mode !== 'https') throw new Error(`HTTPS 测试使用了 ${receiveTask.task.mode}`);
     const actual = new Uint8Array(await (await handle.getFile()).arrayBuffer()), expectedHash = bytesToHex(sha256(source)), actualHash = bytesToHex(sha256(actual));
     if (actual.length !== source.length || actualHash !== expectedHash) throw new Error('重新读取保存文件后哈希不匹配');
     if (mode === 'ws-large') {
       if (frameSizes.length !== 3 || frameSizes[0] !== WS_MAX_MESSAGE_BYTES - 1024 || frameSizes[1] !== WS_MAX_MESSAGE_BYTES - 1024 || frameSizes[2] !== FRAME_HEADER_BYTES + 17) throw new Error('WS 分片没有使用两条大消息和一条尾消息');
       log(`完整 WS 消息字节数：${frameSizes.join(', ')}`);
     }
+    if (mixed) { const extraHandle = await directory.getFileHandle(extraName, { create: false }), bytes = new Uint8Array(await (await extraHandle.getFile()).arrayBuffer()); if (!overlap || bytes.length !== source.length || bytesToHex(sha256(bytes)) !== expectedHash) throw new Error('并行 WS 文件校验失败'); log('并行 WS 文件的字节数与 SHA-256 校验通过'); }
     log(`保存文件字节数：${actual.length}`); log(`源 SHA-256：${expectedHash}`); log(`保存 SHA-256：${actualHash}`); log('PASS：真实传输、写入结束、原始内容与 SHA-256 全部一致');
   } catch (error) { log(`FAIL：${error instanceof Error ? error.message : String(error)}`); }
   finally {
     clearTimeout(deadline); await sink?.abort().catch(() => {});
-    senderTask?.stop(); owner?.stop(); receiver?.stop();
+    clearInterval(discovery); for (const sender of senders.values()) sender.stop(); await receiveTask?.cancel().catch(() => {}); await extraTask?.cancel().catch(() => {}); extraControl?.stop(); owner?.stop(); receiver?.stop();
     if (shareId && ownerToken) await api(`/api/shares/${shareId}`, ownerToken, undefined, 'DELETE').catch(() => {});
     if (savedName && directory) await directory.removeEntry(savedName).catch(() => {});
+    if (extraName && directory) await directory.removeEntry(extraName).catch(() => {});
+    globalThis.WebSocket = nativeWs; globalThis.RTCPeerConnection = nativeRtc;
     buttons.forEach(button => { button.disabled = false; });
   }
 }

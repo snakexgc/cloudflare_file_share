@@ -25,6 +25,22 @@ async function wsUsage(env: Env, snapshot: Record<string, unknown>) {
   const inFlight = live.filter(item => pending.has(item.id)).reduce((sum, item) => sum + item.bytes, 0);
   return { ...latest, wsSettledBytes: Number(latest.wsBytes), wsLiveBytes: inFlight, wsBytes: Number(latest.wsBytes) + inFlight };
 }
+async function httpsUsage(env: Env, snapshot: Record<string, unknown>) {
+  const ids = [...new Set((snapshot.httpsTransfers as { roomId?: string }[]).map(item => item.roomId).filter((id): id is string => Boolean(id)))];
+  const live: { id: string; bytes: number; activeMs: number }[] = [];
+  if (ids.length) await budget(env, '/do-used', { count: ids.length });
+  for (let i = 0; i < ids.length; i += 5) {
+    const responses = await Promise.all(ids.slice(i, i + 5).map(async roomId => {
+      const response = await env.ROOMS.get(env.ROOMS.idFromName(roomId)).fetch(new Request('https://room/internal/admin/https-usage'));
+      assert(response.ok, 503, 'room_unavailable', '无法读取在传 HTTPS 用量'); return response.json<{ transfers: typeof live }>();
+    }));
+    for (const response of responses) live.push(...response.transfers);
+  }
+  const latest = ids.length ? await budget(env, '/snapshot', {}) : snapshot;
+  const pending = new Set((latest.httpsTransfers as { id: string }[]).map(item => item.id));
+  const current = live.filter(item => pending.has(item.id)), bytes = current.reduce((sum, item) => sum + item.bytes, 0);
+  return { ...snapshot, httpsBytes: Number(latest.httpsBytes) + bytes, httpsLiveBytes: bytes, httpsActiveTransfers: latest.httpsActiveTransfers, httpsActiveMs: Number(latest.httpsActiveMs) + current.reduce((sum, item) => sum + item.activeMs, 0) };
+}
 export async function validAdmin(env: Env, hash?: string): Promise<boolean> {
   if (!env.ADMIN_TOKEN || !hash || !/^[a-f0-9]{64}$/.test(hash)) return false;
   return Boolean(await env.DB.prepare('SELECT 1 FROM admin_sessions WHERE token_hash = ? AND key_hash = ? AND expires_at > ?').bind(hash, digest(env.ADMIN_TOKEN), Date.now()).first());
@@ -65,7 +81,7 @@ export async function adminApi(request: Request, env: Env, source: string, hash?
       env.DB.prepare('SELECT COUNT(*) AS files, COALESCE(SUM(size_bytes), 0) AS bytes, SUM(CASE WHEN upload_status = \'ready\' THEN 1 ELSE 0 END) AS ready FROM files').first(),
     ]);
     const count = await env.DB.prepare('SELECT COUNT(*) AS n FROM presence WHERE last_seen > ?').bind(Date.now() - limits(env).leaseMs).first('n');
-    return json({ ledger: await wsUsage(env, ledger), totals, files: rooms, online: online.results, onlineCount: count, limits: limits(env), at: Date.now() });
+    return json({ ledger: await httpsUsage(env, await wsUsage(env, ledger)), totals, files: rooms, online: online.results, onlineCount: count, limits: limits(env), at: Date.now() });
   }
   if (path === '/api/admin/shares' && request.method === 'GET') {
     const cursor = url.searchParams.get('cursor') ?? '';

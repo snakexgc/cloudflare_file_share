@@ -3,7 +3,7 @@ import { limits, type Env } from './config';
 import { assert, errorResponse, HttpError, json, readJson } from './util';
 
 interface Reservation {
-  kind: 'turn' | 'ws' | 'r2' | 'share';
+  kind: 'turn' | 'ws' | 'https' | 'r2' | 'share';
   bytes: number;
   messages: number;
   expiresAt: number;
@@ -22,6 +22,8 @@ interface Ledger {
   turnCommitted: number;
   wsCommitted: number;
   wsMessages: number;
+  httpsCommitted: number;
+  httpsActiveMs: number;
   classA: number;
   classB: number;
   turnSnapshot?: { bytes: number; at: number };
@@ -34,15 +36,16 @@ export class TURNBudget extends DurableObject<Env> {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
       this.ledger = await ctx.storage.get<Ledger>('ledger') ?? {
-        month: '', day: '', requests: 0, doRequests: 0, doWsMessages: 0, d1Read: 0, d1Written: 0, turnCommitted: 0, wsCommitted: 0, wsMessages: 0, classA: 0, classB: 0, reservations: {}, rates: {},
+        month: '', day: '', requests: 0, doRequests: 0, doWsMessages: 0, d1Read: 0, d1Written: 0, turnCommitted: 0, wsCommitted: 0, wsMessages: 0, httpsCommitted: 0, httpsActiveMs: 0, classA: 0, classB: 0, reservations: {}, rates: {},
       };
       this.ledger.doRequests ??= 0; this.ledger.doWsMessages ??= 0; this.ledger.d1Read ??= 0; this.ledger.d1Written ??= 0;
+      this.ledger.httpsCommitted ??= 0; this.ledger.httpsActiveMs ??= 0;
     });
   }
   private roll(now: number) {
     const day = new Date(now).toISOString().slice(0, 10), month = day.slice(0, 7);
     if (this.ledger.month !== month) {
-      Object.assign(this.ledger, { month, turnCommitted: 0, wsCommitted: 0, wsMessages: 0, classA: 0, classB: 0, turnSnapshot: undefined });
+      Object.assign(this.ledger, { month, turnCommitted: 0, wsCommitted: 0, wsMessages: 0, httpsCommitted: 0, httpsActiveMs: 0, classA: 0, classB: 0, turnSnapshot: undefined });
     }
     if (this.ledger.day !== day) { this.ledger.day = day; this.ledger.requests = 0; this.ledger.doRequests = 0; this.ledger.doWsMessages = 0; this.ledger.d1Read = 0; this.ledger.d1Written = 0; }
     for (const [key, rate] of Object.entries(this.ledger.rates)) if (rate.resetAt <= now) delete this.ledger.rates[key];
@@ -134,7 +137,7 @@ export class TURNBudget extends DurableObject<Env> {
         } else if (path === '/reserve') {
           const key = String(data.id), kind = data.kind as Reservation['kind'], bytes = data.bytes, expiresAt = data.expiresAt;
           assert(typeof bytes === 'number' && Number.isSafeInteger(bytes) && bytes >= 0 && typeof expiresAt === 'number' && expiresAt > now, 400, 'invalid_reservation', '预算参数无效');
-          assert(['turn', 'ws', 'r2', 'share'].includes(kind), 400, 'invalid_reservation', '未知资源类型');
+          assert(['turn', 'ws', 'https', 'r2', 'share'].includes(kind), 400, 'invalid_reservation', '未知资源类型');
           const existing = this.ledger.reservations[key];
           if (existing) {
             assert(existing.kind === kind && existing.bytes === bytes, 409, 'reservation_conflict', '重复预留参数不一致');
@@ -151,13 +154,20 @@ export class TURNBudget extends DurableObject<Env> {
               assert(conf.wsEnabled && this.count('ws') < conf.wsMaxConcurrent && this.doUsage(pending + messages) <= conf.doRequestsPerDay, 429, 'ws_budget', 'WS 中继请求预算或并发额度不足');
             }
             if (kind === 'r2') assert(conf.r2Enabled && Object.values(this.ledger.reservations).filter(x => x.kind === 'r2' && !x.ready).length < conf.r2MaxUploads && this.sum('r2') + bytes <= conf.r2MaxBytes, 429, 'r2_budget', 'R2 存储预算或上传额度不足');
+            if (kind === 'https') assert(conf.httpsEnabled && this.count('https') < conf.httpsMaxConcurrent && this.ledger.requests < conf.apiRequestsPerDay && this.doUsage() <= conf.doRequestsPerDay, 429, 'https_budget', 'HTTPS 中继请求预算或并发额度不足');
             if (kind === 'share') assert(Object.values(this.ledger.reservations).filter(x => x.kind === 'share' && x.source === data.source).length < conf.maxSharesPerSource, 429, 'share_limit', '此来源的活动分享数量已达上限');
             this.ledger.reservations[key] = { kind, bytes, messages: Number(data.messages ?? 0), expiresAt, source: typeof data.source === 'string' ? data.source : undefined, roomId: typeof data.roomId === 'string' && /^[a-f0-9]{32}$/.test(data.roomId) ? data.roomId : undefined };
           }
         } else if (path === '/settle' || path === '/release') {
           const key = String(data.id), reservation = this.ledger.reservations[key];
           if (reservation) {
-            if (path === '/settle') this.commit(reservation, Number(data.bytes ?? reservation.bytes), Number(data.messages ?? reservation.messages));
+            if (path === '/settle') {
+              if (reservation.kind === 'https') {
+                const bytes = data.bytes ?? 0, activeMs = data.activeMs ?? 0;
+                assert(typeof bytes === 'number' && Number.isSafeInteger(bytes) && bytes >= 0 && typeof activeMs === 'number' && Number.isSafeInteger(activeMs) && activeMs >= 0, 400, 'invalid_usage', 'HTTPS 用量无效');
+                this.ledger.httpsCommitted += bytes; this.ledger.httpsActiveMs += activeMs;
+              } else this.commit(reservation, Number(data.bytes ?? reservation.bytes), Number(data.messages ?? reservation.messages));
+            }
             delete this.ledger.reservations[key];
           }
         } else if (path !== '/snapshot') throw new HttpError(404, 'not_found', '资源接口不存在');
@@ -169,6 +179,8 @@ export class TURNBudget extends DurableObject<Env> {
           wsBytes: this.ledger.wsCommitted, wsReserved: this.sum('ws'), wsMessages: this.ledger.wsMessages,
           wsRoomIds: [...new Set(Object.values(this.ledger.reservations).filter(x => x.kind === 'ws' && x.roomId).map(x => x.roomId))],
           wsTransfers: Object.entries(this.ledger.reservations).filter(([, value]) => value.kind === 'ws').map(([id, value]) => ({ id, roomId: value.roomId })),
+          httpsBytes: this.ledger.httpsCommitted, httpsActiveMs: this.ledger.httpsActiveMs, httpsActiveTransfers: this.count('https'),
+          httpsTransfers: Object.entries(this.ledger.reservations).filter(([, value]) => value.kind === 'https').map(([id, value]) => ({ id, roomId: value.roomId })),
           r2Bytes: this.sum('r2'), r2Reservations: this.count('r2'), classA: this.ledger.classA, classB: this.ledger.classB,
           r2ActiveUploads: Object.values(this.ledger.reservations).filter(x => x.kind === 'r2' && !x.ready).length,
         } : { ok: true });

@@ -82,6 +82,10 @@ async function handle(request: Request, env: Env): Promise<Response> {
       pair[1].addEventListener('message', event => { if (event.data === 'probe') pair[1].send('probe-ok'); pair[1].close(1000, 'probe complete'); clearTimeout(timer); });
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
+    if (url.pathname === '/api/probe/https' && request.method === 'POST') {
+      assert(limits(env).httpsEnabled, 409, 'https_disabled', 'HTTPS 中继未启用');
+      const data = await readJson(request, 1024); assert(data.message === 'https-probe', 400, 'invalid_probe', 'HTTPS 探测数据无效'); return json({ message: data.message });
+    }
     if (url.pathname === '/api/probe/turn' && request.method === 'POST') {
       await budget(env, '/turn-probe', { source });
       const reservation = `probe:${source}:${Math.floor(Date.now() / 60000)}`;

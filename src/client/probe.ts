@@ -3,7 +3,7 @@ import { api, ApiError } from './api';
 import { addressFamily } from './peer';
 import { rtcSupport } from './rtc';
 
-export interface ProbeConfig { admin: boolean; limits: { turnEnabled: boolean; wsEnabled: boolean; r2Enabled: boolean }; turnConfigured: boolean; turnMissing: string[]; r2Configured: boolean; stunServers: IceServer[] }
+export interface ProbeConfig { admin: boolean; httpOnly?: boolean; limits: { turnEnabled: boolean; wsEnabled: boolean; httpsEnabled?: boolean; r2Enabled: boolean }; turnConfigured: boolean; turnMissing: string[]; r2Configured: boolean; stunServers: IceServer[] }
 export interface ProbeResult { message: string; state: 'ok' | 'pending' | 'unavailable' }
 let turnProbeCache: { iceServers: IceServer[]; expiresAt: number } | undefined;
 export function turnUnavailable(conf: Pick<ProbeConfig, 'limits' | 'turnConfigured' | 'turnMissing'>): string | undefined {
@@ -67,14 +67,15 @@ export function mountProbes(conf: ProbeConfig, retestDirect: () => void) {
   let busy = false;
   const run = async (manual = false) => {
     if (busy) return; busy = true; const button = container.querySelector<HTMLButtonElement>('#retest')!; button.disabled = true;
-    try { const next = await api<ProbeConfig>('/api/config'); conf = next; } catch { /* 可继续探测本地能力与 WS，接口错误由对应检测项报告。 */ }
+    try { const next = await api<ProbeConfig>('/api/config'); conf = { ...next, httpOnly: conf.httpOnly }; } catch { /* 可继续探测本地能力与 WS，接口错误由对应检测项报告。 */ }
     const support = rtcSupport();
     container.querySelector('#rtc-diagnostics')!.textContent = `RTCPeerConnection：${support.constructorType}；安全上下文：${support.secureContext ? '是' : '否'}；RTCSessionDescription：${typeof globalThis.RTCSessionDescription}；RTCIceCandidate：${typeof globalThis.RTCIceCandidate}。${support.message}。本检测不需要摄像头或麦克风权限。`;
-    if (!support.available) punchStatus('当前页面无法创建 WebRTC 连接，后台打洞未运行；在线传输可继续使用 WS');
+    if (!support.available) punchStatus('当前页面无法创建 WebRTC 连接，后台打洞未运行；在线传输可继续使用 WS / HTTPS');
     const tests: [string, () => Promise<string | ProbeResult>][] = [
       ['P2P / NAT', () => probeP2P(conf.stunServers)],
       ['TURN', () => probeTurn(conf)],
-      ['WS 中继', () => conf.limits.wsEnabled ? wsProbe() : Promise.resolve('服务未启用')],
+      ['WS 中继', () => conf.httpOnly ? Promise.resolve('HTTPS 模式跳过 WS 探测') : conf.limits.wsEnabled && typeof WebSocket === 'function' ? wsProbe() : Promise.resolve('服务或浏览器未启用 WS')],
+      ['HTTPS 中继', async () => { if (!conf.limits.httpsEnabled) return '服务未启用'; const result = await api<{ message: string }>('/api/probe/https', undefined, { message: 'https-probe' }); if (result.message !== 'https-probe') throw new Error('HTTP 回显不一致'); return 'HTTP 请求与回显成功 · 完整中继在实际下载时验证'; }],
     ];
     if (conf.admin) tests.push(['R2', async () => { if (!conf.r2Configured || !conf.limits.r2Enabled) return '服务未启用或凭据未齐全'; await api('/api/probe/r2', undefined, {}); return '私有桶可访问 · S3 上传签名和 CORS 在实际传输时验证'; }]);
     const list = container.querySelector('#probe-results')!; list.replaceChildren();

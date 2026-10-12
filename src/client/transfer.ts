@@ -6,6 +6,7 @@ import { api, ApiError, delay } from './api';
 import { ControlSession } from './control';
 import { hashFile, VerifiedSink } from './sink';
 import type { DirectTransport } from './peer';
+import { httpsFetch, readHttpsChunk } from './https';
 
 export type Progress = (fileId: string, label: string, bytes: number, mode?: string, finished?: boolean) => void;
 const terminal = (task: DownloadRequest) => ['canceled', 'failed', 'completed'].includes(task.status);
@@ -28,6 +29,7 @@ export class SendTask {
   async start() {
     try {
       try { await this.file.slice(0, Math.min(1, this.file.size)).arrayBuffer(); } catch { throw new SourceReadError('本地文件不可读，请重新选择原文件'); }
+      if (this.task.mode === 'https') { this.control.track(this.task); void this.runHttps(); return; }
       if (this.task.mode === 'ws') { void this.run(); return; }
       if (this.task.peerId && this.direct) {
         this.pc = this.direct.pc; this.channel = this.direct.channel;
@@ -97,6 +99,31 @@ export class SendTask {
       this.progress(this.task.fileId, '等待接收端校验', this.file.size, this.task.mode);
     } catch (error) { await this.fail(error); }
   }
+  private async runHttps() {
+    if (this.running) return; this.running = true;
+    try {
+      let hash;
+      try { hash = await hashFile(this.file, this.conf.hashChunkBytes, this.abort.signal, this.task.offset); }
+      catch (error) { this.check(); throw new SourceReadError(messageOf(error)); }
+      const chunkBytes = this.task.httpsChunkBytes ?? this.conf.httpsChunkBytes;
+      while (this.sent < this.file.size) {
+        this.check(); const end = Math.min(this.file.size, this.sent + chunkBytes), blob = this.file.slice(this.sent, end);
+        try {
+          for (let offset = 0; offset < blob.size; offset += this.conf.hashChunkBytes) {
+            this.check(); const bytes = new Uint8Array(await blob.slice(offset, offset + this.conf.hashChunkBytes).arrayBuffer());
+            if (bytes.byteLength !== Math.min(this.conf.hashChunkBytes, blob.size - offset)) throw new Error('源文件读取长度发生变化');
+            hash.update(bytes);
+          }
+        } catch (error) { this.check(); throw new SourceReadError(messageOf(error)); }
+        const response = await httpsFetch(this.control, this.task, 'chunk', this.sent, this.abort.signal, this.conf.ackTimeoutMs + 10000, blob);
+        const result = await response.json() as { offset: number };
+        this.check(); if (result.offset !== end) throw new Error('HTTPS 上传确认偏移无效');
+        this.sent = this.acked = end; this.progress(this.task.fileId, '正在发送', end, 'https');
+      }
+      await this.control.signal(this.task, 'file-end', { sha256: bytesToHex(hash.digest()), size: this.file.size });
+      this.check(); this.progress(this.task.fileId, '等待接收端校验', this.file.size, 'https');
+    } catch (error) { await this.fail(error); }
+  }
   private async fail(error: unknown) {
     if (this.abort.signal.aborted) return;
     this.stop();
@@ -109,6 +136,9 @@ export class SendTask {
 export class ReceiveTask {
   private unsubscribe?: () => void;
   private r2Work: Promise<void> = Promise.resolve();
+  private httpsWork: Promise<void> = Promise.resolve();
+  private httpsAttempt = '';
+  private httpsResumed = false;
   private pc?: RTCPeerConnection;
   private channel?: RTCDataChannel;
   private ice: RTCIceCandidateInit[] = [];
@@ -128,20 +158,27 @@ export class ReceiveTask {
   async start(task = this.task) {
     if (this.finished || task.epoch < this.task.epoch) return;
     const attemptKey = `${task.epoch}:${task.transferId}:${task.status}`;
-    if (this.startedAttempt === attemptKey) return;
+    if (this.startedAttempt === attemptKey) { this.task = task; if (task.mode === 'https' && task.sourceHash && this.sink.offset === this.sink.file.size) await this.finish(task.sourceHash); return; }
     this.startedAttempt = attemptKey;
     if (task.epoch !== this.task.epoch || task.transferId !== this.task.transferId) {
       this.stopTransport(); await this.serial; this.task = task;
       if (task.offset !== this.sink.offset) await this.sink.reset();
       this.received = this.sink.offset; this.pendingBytes = 0; this.abort = new AbortController(); this.ice = [];
     } else this.task = task;
+    this.control.track?.(task);
     if (terminal(task)) { if (task.status !== 'completed') await this.fail(new Error(task.error ?? '任务已取消')); return; }
     if (task.status === 'requested') {
       this.progress(task.fileId, task.mode === 'r2' ? '等待分享者上传云端' : '分享者离线或源文件不可读，等待恢复', this.sink.offset, task.mode); return;
     }
-    this.progress(task.fileId, task.mode === 'p2p' ? '正在连接直传' : task.mode === 'turn' ? '正在连接 TURN' : task.mode === 'ws' ? '正在连接 WS 中继' : '准备云端下载', this.sink.offset, task.mode);
+    this.progress(task.fileId, task.mode === 'p2p' ? '正在连接直传' : task.mode === 'turn' ? '正在连接 TURN' : task.mode === 'ws' ? '正在连接 WS 中继' : task.mode === 'https' ? '正在连接 HTTPS 中继' : '准备云端下载', this.sink.offset, task.mode);
     if (task.mode === 'ws') { this.control.relayAck(task, this.sink.offset); this.armTimeout(); }
     else if (task.mode === 'r2') { if (task.status === 'transferring') this.r2Work = this.downloadR2(); }
+    else if (task.mode === 'https') {
+      const key = `${task.epoch}:${task.transferId}`;
+      if (this.httpsAttempt !== key) { this.httpsAttempt = key; this.httpsWork = this.downloadHttps(); }
+      this.armTimeout();
+      if (task.sourceHash && this.sink.offset === this.sink.file.size) await this.finish(task.sourceHash);
+    }
     else if (task.peerId) {
       const direct = this.directFor?.(task.peerId);
       if (!direct) { void this.advance(new Error('预热直连已失效')); return; }
@@ -165,7 +202,7 @@ export class ReceiveTask {
     if (event.type === 'stop-attempt' || event.type === 'completed') return;
     if (event.type === 'relay-error' || event.type === 'transport-error' || event.type === 'r2-error') { await this.advance(new Error((event.data as { message?: string })?.message ?? task.error ?? '传输失败')); return; }
     if (event.type === 'r2-ready') { this.task = task; if (!this.r2Running) this.r2Work = this.downloadR2(); return; }
-    if (event.type === 'file-end') { if (this.task.mode === 'ws') await this.finish((event.data as { sha256: string }).sha256); return; }
+    if (event.type === 'file-end') { if (this.task.mode === 'ws' || this.task.mode === 'https') await this.finish((event.data as { sha256: string }).sha256); return; }
     if (event.type === 'rtc-offer') {
       if (this.pc) return;
       this.task = task;
@@ -263,8 +300,45 @@ export class ReceiveTask {
     } catch (error) { if (!this.abort.signal.aborted && !this.finished && generation === this.generation) { if (error instanceof SinkWriteError) await this.fail(error); else await this.advance(error); } }
     finally { this.r2Running = false; }
   }
+  private async downloadHttps() {
+    const generation = this.generation, task = this.task, signal = this.abort.signal;
+    try {
+      const chunkBytes = task.httpsChunkBytes ?? this.conf.httpsChunkBytes;
+      while (this.sink.offset < this.sink.file.size) {
+        const offset = this.sink.offset, length = Math.min(chunkBytes, this.sink.file.size - offset);
+        let payload: Uint8Array | undefined;
+        for (let attempt = 0; !payload; ) {
+          try {
+            const response = await httpsFetch(this.control, task, 'chunk', offset, signal, 35000, undefined, 0);
+            if (response.status === 204) { await delay(1000, signal); continue; }
+            if (response.headers.get('X-File-Offset') !== String(offset)) throw new Error('HTTPS 数据块偏移不一致');
+            payload = await readHttpsChunk(response, length, signal);
+          } catch (error) { if (signal.aborted || error instanceof ApiError || attempt++ >= 2) throw error; await delay(250 * 2 ** attempt, signal); }
+        }
+        if (generation !== this.generation || this.finished) return;
+        const bytes = payload;
+        const write = this.serial.then(async () => { if (generation === this.generation && !this.finished) { try { await this.sink.write(bytes, offset); } catch (error) { throw new SinkWriteError(messageOf(error)); } } });
+        this.serial = write.catch(() => {}); await write;
+        if (generation !== this.generation || this.finished) return;
+        this.received = this.sink.offset;
+        const response = await httpsFetch(this.control, task, 'ack', this.sink.offset, signal, 20000, {});
+        const result = await response.json() as { offset: number };
+        if (result.offset !== this.sink.offset) throw new Error('HTTPS ACK 确认偏移不一致');
+        this.armTimeout(); this.progress(task.fileId, '正在接收', this.sink.offset, 'https');
+      }
+      if (this.task.sourceHash) await this.finish(this.task.sourceHash);
+    } catch (error) {
+      if (!signal.aborted && !this.finished && generation === this.generation) {
+        if (error instanceof SinkWriteError) void this.fail(error); else void this.advance(error);
+      }
+    }
+  }
   async advance(error: unknown) {
     if (this.finished || this.advancing || this.finalizing) return; this.advancing = true;
+    if (this.task.mode === 'https' && !this.httpsResumed && !(error instanceof ApiError && [403, 410, 429].includes(error.status))) {
+      this.httpsResumed = true; this.advancing = false;
+      await this.migrate('resume', { transferId: this.task.transferId }); return;
+    }
     this.stopTransport(); await this.serial;
     try {
       this.progress(this.task.fileId, `正在切换传输方式：${messageOf(error)}`, this.sink.offset, this.task.mode);
@@ -278,15 +352,17 @@ export class ReceiveTask {
     await this.migrate('upgrade', { peerId });
   }
   async switchTo(mode: string) { if (!this.finished && !this.advancing && !this.finalizing) await this.migrate('switch', { mode }); }
-  private async migrate(operation: 'upgrade' | 'switch', choice: Record<string, string>) {
-    this.advancing = true; this.stopTransport(); await this.serial; await this.r2Work;
+  private async migrate(operation: 'upgrade' | 'switch' | 'resume', choice: Record<string, string>) {
+    this.advancing = true; this.stopTransport(); await this.serial; await this.r2Work; await this.httpsWork;
+    if (choice.mode === 'https') { this.httpsResumed = false; this.control.preferHttp?.(true); }
+    else if (choice.mode === 'ws' || choice.mode === 'auto') await this.control.ensureWs?.().catch(() => {});
     try {
       const task = await api<DownloadRequest>(`${this.control.base}/download-requests/${this.task.id}/${operation}`, this.control.sessionToken, { epoch: this.task.epoch, offset: this.sink.offset, ...choice });
       this.advancing = false; await this.start(task);
       for (const event of this.deferred.splice(0)) if (event.type !== 'attempt') await this.event(event);
     } catch (error) { this.advancing = false; await this.advance(error); }
   }
-  private stopTransport() { this.generation++; clearTimeout(this.timeout); this.abort.abort(new Error('旧传输已停止')); this.unsubscribe?.(); this.unsubscribe = undefined; if (!this.task.peerId) { if (this.channel) { this.channel.onclose = null; this.channel.onerror = null; this.channel.close(); } this.pc?.close(); } this.pc = undefined; this.channel = undefined; }
+  private stopTransport() { this.generation++; this.httpsAttempt = ''; clearTimeout(this.timeout); this.abort.abort(new Error('旧传输已停止')); this.unsubscribe?.(); this.unsubscribe = undefined; if (!this.task.peerId) { if (this.channel) { this.channel.onclose = null; this.channel.onerror = null; this.channel.close(); } this.pc?.close(); } this.pc = undefined; this.channel = undefined; }
   async fail(error: unknown) { if (this.finished) return; this.finished = true; this.stopTransport(); await this.serial; await this.sink.abort().catch(() => {}); this.progress(this.task.fileId, `未完成：${messageOf(error)}`, this.sink.offset, this.task.mode); await api(`${this.control.base}/download-requests/${this.task.id}`, this.control.sessionToken, undefined, 'DELETE').catch(() => {}); }
   async cancel() { if (!this.finished) await this.fail(new Error('已取消')); }
   get done() { return this.finished; }

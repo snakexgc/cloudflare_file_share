@@ -7,6 +7,7 @@ import { assert, bearer, budget, constantEqual, digest, errorResponse, HttpError
 import { findMultipartUploads, listParts, presign, r2Configured, validateParts } from './r2';
 import { generateTurn, revokeTurn } from './turn';
 import { meteredDB } from './db';
+import { closeHttpsRoom, HttpsRelay } from './https-relay';
 
 interface StoredFile extends FileInfo { r2Key?: string; modeAdminHash?: string }
 interface Room {
@@ -34,12 +35,14 @@ export class ShareRoom extends DurableObject<Env> {
   private sessions = new Map<string, SessionInfo>();
   private dirty = new Set<string>();
   private relays = new Map<string, Relay>();
+  private httpsRelays = new Map<string, HttpsRelay>();
   private relayTimer?: ReturnType<typeof setTimeout>;
   private retired = new Map<string, { ownerId: string; fileId: string; epoch: number; size: number; remaining: number; until: number }>();
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, { ...env, DB: meteredDB(env.DB, env) });
     ctx.blockConcurrencyWhile(async () => {
       this.room = await ctx.storage.get<Room>('room');
+      if (this.room) closeHttpsRoom(this.room.id);
       if (this.room?.uploads.some(attempt => !Object.hasOwn(attempt, 'partSize'))) {
         // 首次升级 v1 状态时固定当时的分片大小；v1 默认是 64 MiB。
         const previousPartSize = JSON.parse(env.LIMITS ?? '{}').multipartPartBytes ?? 64 * 1024 ** 2;
@@ -108,13 +111,14 @@ export class ShareRoom extends DurableObject<Env> {
     session.events.push(event);
     while (session.events.length > conf.eventQueueSize || new TextEncoder().encode(JSON.stringify(session.events)).byteLength > conf.eventQueueBytes) session.events.shift();
     this.dirty.add(session.id);
-    this.send(session.id, { type: 'event', event });
+    // HTTPS tasks are discovered and coordinated through HTTP, even with a WS open for another file.
+    if (request?.mode !== 'https') this.send(session.id, { type: 'event', event });
   }
   private both(type: string, request: DownloadRequest, data?: unknown) { this.emit(request.ownerId, type, request, data); this.emit(request.receiverId, type, request, data); }
   private scheduleRelayDeadline() {
     clearTimeout(this.relayTimer); this.relayTimer = undefined;
-    if (!this.relays.size) return;
-    const deadline = Math.min(this.state().expiresAt, ...[...this.relays.values()].map(relay => relay.lastAck + limits(this.env).ackTimeoutMs));
+    if (!this.relays.size && !this.httpsRelays.size) return;
+    const deadline = Math.min(this.state().expiresAt, ...[...this.relays.values(), ...this.httpsRelays.values()].map(relay => relay.lastAck + limits(this.env).ackTimeoutMs));
     // 活跃中继不能休眠，否则内存中的 credit / offset 会在大消息到达前丢失。
     this.relayTimer = setTimeout(() => {
       this.relayTimer = undefined;
@@ -140,6 +144,7 @@ export class ShareRoom extends DurableObject<Env> {
     if (state.status === 'active') times.push(state.expiresAt);
     if (state.nextCleanupAt) times.push(state.nextCleanupAt);
     for (const relay of this.relays.values()) times.push(relay.lastAck + conf.ackTimeoutMs);
+    for (const relay of this.httpsRelays.values()) times.push(relay.lastAck + conf.ackTimeoutMs);
     for (const request of state.requests.filter(active)) {
       for (const key of [request.ownerId, request.receiverId]) { const session = key ? this.sessions.get(key) : undefined; if (session) times.push(this.seenAt(session) + conf.leaseMs); }
     }
@@ -164,6 +169,15 @@ export class ShareRoom extends DurableObject<Env> {
     await this.env.DB.prepare('UPDATE files SET sha256 = ?, r2_key = ?, upload_status = ? WHERE id = ? AND share_id = ?').bind(file.sha256 ?? null, file.r2Key ?? null, file.uploadStatus, file.id, this.state().id).run();
   }
   private async retireTransport(task: DownloadRequest) {
+    if (task.mode === 'https') {
+      const relay = this.httpsRelays.get(task.transferId);
+      this.httpsRelays.delete(task.transferId); relay?.close(task.error ?? 'HTTPS 传输已停止');
+      const bytes = Math.max(task.httpsBytes ?? 0, relay?.bytes ?? 0);
+      if (task.reservationId) await budget(this.env, '/settle', { id: task.reservationId, bytes, activeMs: Math.max(0, Date.now() - (task.httpsStartedAt ?? Date.now())) });
+      console.log(JSON.stringify({ type: 'https-relay', requestId: task.id, bytes, durationMs: Math.max(0, Date.now() - (task.httpsStartedAt ?? Date.now())), reason: task.error ?? task.status }));
+      delete task.httpsStartedAt; delete task.httpsBytes; delete task.httpsChunkBytes;
+      this.scheduleRelayDeadline();
+    }
     if (task.mode === 'ws' && task.ownerId) {
       for (const [key, entry] of this.retired) if (entry.until <= Date.now()) this.retired.delete(key);
       this.retired.set(task.transferId, { ownerId: task.ownerId, fileId: task.fileId, epoch: task.epoch, size: this.file(task.fileId).size, remaining: limits(this.env).windowBytes, until: Date.now() + limits(this.env).leaseMs });
@@ -191,7 +205,7 @@ export class ShareRoom extends DurableObject<Env> {
   }
   private async chooseRelayOrR2(task: DownloadRequest) {
     const conf = limits(this.env), file = this.file(task.fileId), owner = this.owner(file.id), receiver = this.sessions.get(task.receiverId);
-    if (conf.wsEnabled && file.size <= conf.wsMaxFileBytes && owner && receiver && owner.capabilities.ws && receiver.capabilities.ws && this.socket(owner.id) && this.socket(receiver.id) && (this.relays.size + 1) * conf.windowBytes <= conf.roomBufferBytes) {
+    if (conf.wsEnabled && file.size <= conf.wsMaxFileBytes && owner && receiver && owner.capabilities.ws && receiver.capabilities.ws && this.socket(owner.id) && this.socket(receiver.id) && this.relayWindowBytes() + conf.windowBytes <= conf.roomBufferBytes) {
       const reservationId = `ws:${task.id}:${task.epoch}`;
       try {
         const messages = Math.ceil((file.size - task.offset) / conf.chunkBytes) * 2 + 16;
@@ -203,7 +217,43 @@ export class ShareRoom extends DurableObject<Env> {
       } catch (error) { task.error = error instanceof Error ? error.message : 'WS 预算不足'; }
     }
     if (task.forcedMode === 'ws') { task.status = 'failed'; task.error = '指定的 WS 不可用'; this.both('failed', task); return; }
+    if (await this.startHttps(task)) return;
     await this.startR2(task);
+  }
+  private relayWindowBytes() { return this.relays.size * limits(this.env).windowBytes + [...this.httpsRelays.values()].reduce((sum, relay) => sum + relay.bufferBytes, 0); }
+  private async locked<T>(operation: () => Promise<T>): Promise<T> {
+    // A rejection escaping blockConcurrencyWhile resets the object, including unrelated transfers.
+    const result = await this.ctx.blockConcurrencyWhile(async () => {
+      try { return { value: await operation() }; } catch (error) { return { error }; }
+    });
+    if ('error' in result) throw result.error;
+    return result.value;
+  }
+  private async startHttps(task: DownloadRequest): Promise<boolean> {
+    const conf = limits(this.env), file = this.file(task.fileId), owner = this.owner(file.id), receiver = this.sessions.get(task.receiverId);
+    if (task.forcedMode === 'https') task.mode = 'https';
+    let relay: HttpsRelay | undefined;
+    if (conf.httpsEnabled && file.size <= conf.httpsMaxFileBytes && owner?.capabilities.https && receiver?.capabilities.https && this.relayWindowBytes() + Math.min(conf.httpsChunkBytes, file.size - task.offset) <= conf.roomBufferBytes) {
+      const transferId = id(), reservationId = `https:${task.id}:${task.epoch}`;
+      try {
+        relay = new HttpsRelay(file.size, task.offset, conf.httpsChunkBytes,
+          () => this.locked(async () => {
+            this.ensureActive(); assert(active(task) && task.mode === 'https' && task.transferId === transferId && this.httpsRelays.get(transferId) === relay, 409, 'stale_transfer', 'HTTPS 传输已切换');
+            assert(this.online(owner) && this.online(receiver), 503, 'relay_disconnected', 'HTTPS 对端会话已离线');
+            task.status = 'transferring'; await this.persist();
+          }),
+          count => this.locked(async () => {
+            if (task.transferId !== transferId || this.httpsRelays.get(transferId) !== relay) return;
+            task.httpsBytes = (task.httpsBytes ?? 0) + count; await this.ctx.storage.put('room', this.state());
+          }), this.state().id);
+        await budget(this.env, '/reserve', { id: reservationId, kind: 'https', bytes: 0, roomId: this.state().id, expiresAt: this.state().expiresAt });
+        this.ensureActive(); task.mode = 'https'; task.ownerId = owner.id; task.transferId = transferId; task.reservationId = reservationId;
+        task.httpsChunkBytes = conf.httpsChunkBytes; task.httpsBytes = 0; task.httpsStartedAt = Date.now(); task.status = 'connecting'; delete task.sourceHash;
+        this.httpsRelays.set(transferId, relay); this.both('attempt', task); return true;
+      } catch (error) { relay?.close(); await budget(this.env, '/release', { id: reservationId }); task.error = error instanceof Error ? error.message : 'HTTPS 中继不可用'; }
+    }
+    if (task.forcedMode === 'https') { task.status = 'failed'; task.error ??= '指定的 HTTPS 中继不可用'; this.both('failed', task); }
+    return false;
   }
   private async r2Allowed(task: DownloadRequest) {
     const hashes = [task.adminGrant, this.state().r2AdminHash, this.sessions.get(task.receiverId)?.adminHash, task.ownerId ? this.sessions.get(task.ownerId)?.adminHash : undefined, this.owner(task.fileId)?.adminHash];
@@ -215,7 +265,7 @@ export class ShareRoom extends DurableObject<Env> {
     return false;
   }
   private setMode(file: StoredFile, mode: unknown, hash: string) {
-    assert(['auto', 'p2p', 'turn', 'ws', 'r2'].includes(String(mode)), 400, 'invalid_mode', '传输方式无效');
+    assert(['auto', 'p2p', 'turn', 'ws', 'https', 'r2'].includes(String(mode)), 400, 'invalid_mode', '传输方式无效');
     file.forcedMode = mode === 'auto' ? undefined : mode as Mode; file.modeAdminHash = hash;
     for (const task of this.state().requests.filter(x => x.fileId === file.id && active(x))) this.emit(task.receiverId, 'mode-change', task, { mode });
   }
@@ -234,6 +284,7 @@ export class ShareRoom extends DurableObject<Env> {
     if (!task.forcedMode && !owner && file.uploadStatus === 'ready' && await this.r2Allowed(task)) { await this.startR2(task); return; }
     if (!owner || !receiver) { task.status = 'requested'; this.emit(task.receiverId, 'waiting-source', task); return; }
     task.ownerId = owner.id;
+    if (task.forcedMode === 'https') { await this.startHttps(task); return; }
     if (task.forcedMode === 'ws') { await this.chooseRelayOrR2(task); return; }
     if (task.forcedMode === 'turn') { await this.startTurn(task); return; }
     if (task.forcedMode === 'p2p' && (!owner.capabilities.webrtc || !receiver.capabilities.webrtc)) { task.status = 'failed'; task.error = '指定的 P2P 不可用，浏览器未提供 WebRTC'; this.both('failed', task); return; }
@@ -255,6 +306,7 @@ export class ShareRoom extends DurableObject<Env> {
     if (previous === 'r2') { task.status = 'failed'; this.both('failed', task); await this.noDemand(file.id); return; }
     if (previous === 'p2p' && await this.startTurn(task)) return;
     if (previous === 'p2p' || previous === 'turn') await this.chooseRelayOrR2(task);
+    else if (previous === 'ws' && await this.startHttps(task)) return;
     else await this.startR2(task);
   }
   private async startTurn(task: DownloadRequest): Promise<boolean> {
@@ -432,6 +484,7 @@ export class ShareRoom extends DurableObject<Env> {
       const file = this.file(task.fileId);
       assert(!file.sha256 || file.sha256 === payload.sha256, 409, 'source_changed', '源文件内容发生变化');
       if (task.mode === 'ws') { const relay = this.relays.get(task.transferId); assert(relay && relay.acked === file.size, 409, 'relay_incomplete', '接收端尚未确认所有字节'); }
+      if (task.mode === 'https') { const relay = this.httpsRelays.get(task.transferId); assert(relay && relay.acked === file.size, 409, 'relay_incomplete', '接收端尚未确认所有 HTTPS 字节'); }
       task.sourceHash = payload.sha256; file.sha256 = payload.sha256; await this.saveFile(file);
       this.emit(task.receiverId, 'file-end', task, payload);
     } else if (kind === 'completed') {
@@ -479,7 +532,27 @@ export class ShareRoom extends DurableObject<Env> {
     socket.send(message); relay.sent += frame.payload.byteLength; relay.bytes += frame.payload.byteLength; relay.messages++; task.status = 'transferring';
     // 文件消息和每块进度只在内存处理；绝不写入 D1 / DO storage / R2。
   }
+  private async httpsRequest(request: Request, requestId: string, operation: string): Promise<Response> {
+    try {
+      const data = operation === 'ack' ? await readJson(request, 1024) : Object.fromEntries(new URL(request.url).searchParams);
+      const epoch = operation === 'ack' ? data.epoch : Number(data.epoch), offset = operation === 'ack' ? data.offset : Number(data.offset);
+      assert(typeof epoch === 'number' && Number.isSafeInteger(epoch) && epoch >= 1 && typeof offset === 'number' && Number.isSafeInteger(offset) && offset >= 0 && (operation === 'ack' || /^\d+$/.test(String(data.epoch)) && /^\d+$/.test(String(data.offset))), 400, 'invalid_offset', 'HTTPS epoch 或偏移无效');
+      const relay = await this.locked(async () => {
+        const session = this.session(request), task = this.requestFor(requestId, session, epoch);
+        assert(active(task) && task.mode === 'https' && data.transferId === task.transferId && data.fileId === task.fileId, 409, 'stale_transfer', 'HTTPS 任务身份不一致或已经结束');
+        assert((operation === 'chunk' && request.method === 'POST' ? task.ownerId : task.receiverId) === session.id, 403, 'relay_forbidden', '没有此 HTTPS 中继权限');
+        const relay = this.httpsRelays.get(task.transferId);
+        assert(relay, 409, 'relay_restarted', 'HTTPS 内存缓冲已重置，请重建传输');
+        if (operation === 'ack') { const response = relay.acknowledge(offset); task.offset = offset; await this.persist(); return response; }
+        await this.persist(); return relay;
+      });
+      if (relay instanceof Response) return relay;
+      return request.method === 'POST' ? await relay.upload(request, offset) : await relay.download(request, offset);
+    } catch (error) { return errorResponse(error); }
+  }
   async fetch(request: Request): Promise<Response> {
+    const httpsRoute = new URL(request.url).pathname.match(/^\/api\/shares\/([a-f0-9]{32})\/download-requests\/([a-f0-9]{32})\/https\/(chunk|ack)$/);
+    if (httpsRoute && httpsRoute[1] === this.room?.id && (httpsRoute[3] === 'chunk' && ['GET', 'POST'].includes(request.method) || httpsRoute[3] === 'ack' && request.method === 'POST')) return this.httpsRequest(request, httpsRoute[2], httpsRoute[3]);
     return this.ctx.blockConcurrencyWhile(async () => {
       try {
         const path = new URL(request.url).pathname, method = request.method;
@@ -489,6 +562,7 @@ export class ShareRoom extends DurableObject<Env> {
         }
         if (path === '/internal/sweep') { await this.sweep(); await this.persist(); return json({ ok: true }); }
         if (path === '/internal/admin/ws-usage') return json({ transfers: [...this.relays.values()].map(relay => ({ id: this.state().requests.find(task => task.id === relay.requestId)?.reservationId, bytes: relay.bytes })) });
+        if (path === '/internal/admin/https-usage') return json({ transfers: this.state().requests.filter(task => task.mode === 'https' && active(task) && task.reservationId).map(task => ({ id: task.reservationId, bytes: Math.max(task.httpsBytes ?? 0, this.httpsRelays.get(task.transferId)?.bytes ?? 0), activeMs: Math.max(0, Date.now() - (task.httpsStartedAt ?? Date.now())) })) });
         if (path === '/internal/admin/snapshot') return json({ ...this.snapshot(), files: this.state().files.map(({ modeAdminHash: _hash, ...file }) => file), sessions: [...this.sessions.values()].filter(s => this.online(s)).map(s => ({ id: s.id, role: s.role, lastSeen: this.seenAt(s), capabilities: s.capabilities })), requests: this.state().requests.map(({ adminGrant: _grant, ...task }) => task) });
         if (path === '/internal/admin/revoke' && method === 'DELETE') { this.state().status = 'revoked'; await this.cleanup(); await this.persist(); return json({ ok: true }); }
         const adminMode = path.match(/^\/internal\/admin\/files\/([a-f0-9]{32})\/mode$/);
@@ -594,10 +668,10 @@ export class ShareRoom extends DurableObject<Env> {
           assert(this.state().requests.filter(active).length < limits(this.env).maxRequests, 429, 'download_limit', '下载并发已达上限');
           this.state().requests = this.state().requests.filter(active).concat(this.state().requests.filter(x => !active(x)).slice(-32));
           const task: DownloadRequest = { id: id(), fileId: String(data.fileId), receiverId: session.id, epoch: 1, mode: 'p2p', status: 'requested', offset: 0, transferId: id(), createdAt: Date.now() };
-          if (data.mode && data.mode !== 'auto') { assert(await validAdmin(this.env, request.headers.get('X-File-Share-Admin') ?? undefined), 403, 'admin_required', '指定传输方式需要管理员登录'); assert(['p2p', 'turn', 'ws', 'r2'].includes(String(data.mode)), 400, 'invalid_mode', '传输方式无效'); task.forcedMode = data.mode as Mode; task.adminGrant = session.adminHash; }
+          if (data.mode && data.mode !== 'auto') { assert(await validAdmin(this.env, request.headers.get('X-File-Share-Admin') ?? undefined), 403, 'admin_required', '指定传输方式需要管理员登录'); assert(['p2p', 'turn', 'ws', 'https', 'r2'].includes(String(data.mode)), 400, 'invalid_mode', '传输方式无效'); task.forcedMode = data.mode as Mode; task.adminGrant = session.adminHash; }
           this.state().requests.push(task); await this.activate(task); await this.persist(); return json(this.publicTask(task), 201);
         }
-        const downloadRoute = route.match(/^\/download-requests\/([a-f0-9]{32})(?:\/(advance|upgrade|switch))?$/);
+        const downloadRoute = route.match(/^\/download-requests\/([a-f0-9]{32})(?:\/(advance|upgrade|switch|resume))?$/);
         if (downloadRoute) {
           const session = this.session(request, method === 'DELETE'), task = this.requestFor(downloadRoute[1], session);
           assert(task.receiverId === session.id, 403, 'receiver_required', '只能取消或切换本人的下载任务');
@@ -606,7 +680,7 @@ export class ShareRoom extends DurableObject<Env> {
             const data = await readJson(request); this.requestFor(task.id, session, data.epoch);
             if (downloadRoute[2] === 'switch') {
               const file = this.file(task.fileId), directAdmin = request.headers.get('X-File-Share-Admin');
-              assert(active(task) && ['auto', 'p2p', 'turn', 'ws', 'r2'].includes(String(data.mode)), 409, 'invalid_switch', '任务状态或传输方式无效');
+              assert(active(task) && ['auto', 'p2p', 'turn', 'ws', 'https', 'r2'].includes(String(data.mode)), 409, 'invalid_switch', '任务状态或传输方式无效');
               const fileAuthorized = data.mode === (file.forcedMode ?? 'auto') && await validAdmin(this.env, file.modeAdminHash);
               assert(fileAuthorized || await validAdmin(this.env, directAdmin ?? undefined), 403, 'admin_required', '切换指定方式需要管理员授权');
               assert(typeof data.offset === 'number' && Number.isSafeInteger(data.offset) && data.offset >= task.offset && data.offset <= file.size, 400, 'invalid_offset', '恢复偏移无效');
@@ -614,6 +688,12 @@ export class ShareRoom extends DurableObject<Env> {
               task.epoch++; task.offset = data.offset; task.transferId = id(); task.mode = 'p2p'; task.forcedMode = data.mode === 'auto' ? undefined : data.mode as Mode;
               task.adminGrant = directAdmin ?? file.modeAdminHash; task.status = 'requested'; delete task.peerId; delete task.sourceHash;
               await this.activate(task); await this.noDemand(file.id);
+            } else if (downloadRoute[2] === 'resume') {
+              assert(active(task) && task.mode === 'https' && data.transferId === task.transferId, 409, 'invalid_resume', '只有当前 HTTPS 任务可以重建');
+              assert(typeof data.offset === 'number' && Number.isSafeInteger(data.offset) && data.offset >= task.offset && data.offset <= this.file(task.fileId).size, 400, 'invalid_offset', '恢复偏移无效');
+              await this.retireTransport(task); this.both('stop-attempt', task);
+              task.epoch++; task.offset = data.offset; task.transferId = id(); delete task.sourceHash;
+              if (!await this.startHttps(task) && task.forcedMode !== 'https') await this.startR2(task);
             } else if (downloadRoute[2] === 'upgrade') {
               assert(active(task) && !task.forcedMode && task.mode !== 'p2p', 409, 'upgrade_disabled', '指定方式或任务状态不允许自动切换');
               const peer = this.state().peers?.find(p => p.id === data.peerId && p.ownerId === task.ownerId && p.receiverId === session.id && p.ownerReady && p.receiverReady);
@@ -765,6 +845,11 @@ export class ShareRoom extends DurableObject<Env> {
       if (task.mode === 'ws') {
         const relay = this.relays.get(task.transferId);
         if (!relay || now - relay.lastAck >= conf.ackTimeoutMs) { task.error = 'WS 中继重启或 ACK 超时'; await this.retireTransport(task); this.both('relay-error', task); }
+      }
+      if (task.mode === 'https') {
+        const relay = this.httpsRelays.get(task.transferId);
+        if (relay && now - relay.lastAck >= conf.ackTimeoutMs) { task.error = 'HTTPS 数据块或 ACK 超时'; await this.retireTransport(task); this.both('relay-error', task); }
+        // A missing volatile relay is recovered explicitly by the receiver's /resume request.
       }
       if (this.file(task.fileId).uploadStatus !== 'ready' && (!owner || !this.online(owner) || !owner.capabilities.readable.includes(task.fileId))) {
         if (task.status !== 'requested') { task.status = 'requested'; task.epoch++; await this.retireTransport(task); this.both('waiting-source', task); }
