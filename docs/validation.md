@@ -173,3 +173,7 @@ Edge 实际页面验证错误提取密码不显示文件、正确密码进入分
 Edge 浏览器确认默认输入为 2、短链接焦点无内层 outline 且由完整容器高亮、检测面板首次为 collapsed 并位于文件卡片之后；展开后能查看实际检测结果，分享文件页同样默认折叠。截图 `docs/screenshots/share-layout-local-2026-10-12.png` 保留在 Git 忽略目录，页面测试分享 `a5dcbb51c6d8429ca80acf5d1094bacb` 已撤销。
 
 另建独立本地 Wrangler 状态目录，仅在该测试配置中把不活跃时限缩为 **5 秒**。创建 2 小时有效期的零字节测试分享后，8 秒内不再向房间发送任何请求；先直接查询本地 D1，记录已为 `expired / cleaned` 且剩余文件行数为 0，随后 HTTP 返回 410 与 `owner_inactive`。证明真实本地 Alarm 自动执行清理，不依赖访问触发，也未手动调用 Alarm。该加速测试不会修改正式站点的 30 分钟设置；未进行云端实际等待 30 分钟的时长验收。
+
+提交 `610e412` 已上传至 GitHub `main`，Worker 发布版本为 `ee8af2d6-a4f7-4ebc-ac99-e8bb0acc7fb4`。正式域名与 workers.dev 的 `/api/config` 均确认 `defaultShareHours:2`、`ownerIdleTimeoutMs:1800000`，静态资源为 `index-BlBSDQbB.js`。线上浏览器确认输入为 2、检测区收起且位于文件卡片下方、短链接内层 outline 为 none 并由外框提供焦点提示；完整截图保存为 `docs/screenshots/share-layout-live-2026-10-12.png`（Git 忽略）。
+
+线上创建 API 省略有效期，确认原期限为 2 小时；带密码短链接的权限隔离、冲突和解锁复测通过。纯 HTTP 控制 / HTTPS 数据传输 **65,553 字节**，保存后重新读取 SHA-256 为 `ca32f06a037dd7b4fe417817d1d76fff8f18120fcdd0c6d4977a2d091f16e866`，与源一致，服务端 completed，全程无 WS。测试分享 `8ac6963e18954546b3ec1eb0675ce36b` 已撤销、cleaned，随后读取 410；本地开发服务已停止，未操作用户分享或云端对象。
