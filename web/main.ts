@@ -12,6 +12,7 @@ import { PeerManager } from '../src/client/peer';
 import { mountProbes, punchStatus } from '../src/client/probe';
 import { adminMain } from './admin';
 import { rtcSupport } from '../src/client/rtc';
+import { MODE_LABELS, TransferSpeed } from '../src/client/speed';
 
 interface PublicConfig { admin: boolean; limits: Limits; stunServers: IceServer[]; r2Configured: boolean; turnConfigured: boolean; turnMissing: string[]; challengeRequired: boolean; turnstileSiteKey?: string }
 const icons = {
@@ -45,6 +46,10 @@ const pendingCredits = new Map<string, Record<string, unknown>>();
 let eventQueue: Promise<void> = Promise.resolve();
 let challengeToken = '';
 let ended = false;
+let createdPassword = '';
+let transferTimer: ReturnType<typeof setInterval> | undefined;
+const speedMeters = new Map<string, TransferSpeed>();
+const lastModes = new Map<string, string>();
 const $ = <T extends HTMLElement = HTMLElement>(selector: string) => document.querySelector<T>(selector)!;
 function escape(value: string) { return value.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!); }
 function size(bytes: number) { if (!bytes) return '0 B'; const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']; const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), 4); return `${(bytes / 1024 ** i).toLocaleString('zh-CN', { maximumFractionDigits: i ? 1 : 0 })} ${units[i]}`; }
@@ -68,7 +73,7 @@ function toast(message: string) { const element = $('#toast'); element.textConte
 function error(message: string) { const element = $('#error'); element.textContent = message; element.hidden = !message; }
 function fileTile(file: { name: string; size: number }, extra = '') { const ext = file.name.includes('.') ? file.name.split('.').pop()!.slice(0, 5).toUpperCase() : 'FILE'; return `<span class="file-symbol">${escape(ext || 'FILE')}</span><span class="file-description"><strong title="${escape(file.name)}">${escape(file.name)}</strong><small>${size(file.size)}</small></span>${extra}`; }
 function renderHome() {
-  shell(`<section class="hero"><div class="eyebrow"><span class="live-dot"></span> 让文件，直接抵达</div><h1>文件轻轻一传，<br/><span>分享就这么简单。</span></h1><p>无需注册，保留原文件。选择文件，生成链接，<br class="desktop-break"/>让下一次分享少一点麻烦。</p></section><div class="workspace"><section class="card upload-card"><div class="card-heading"><div><h2>创建一次临时分享</h2><p>从你的设备，传到对方的设备。</p></div><span class="step-label">01 / 开始分享</span></div><label class="dropzone" id="dropzone" for="file-input"><span class="upload-orbit">${icon('upload')}</span><strong>把文件拖到这里</strong><span>或点击选择文件 · 支持多文件</span><small id="file-limit">正在读取服务配置…</small><input id="file-input" type="file" multiple aria-label="选择分享文件"/></label><div id="selected-files" class="selected-files"></div><form id="create-form"><div class="expiry-field"><label for="hours">链接有效期<small>从创建分享时开始计时</small></label><div class="number-input"><input id="hours" name="expiresInHours" type="number" min="1" max="24" step="1" value="6" required inputmode="numeric"/><span>小时</span></div></div><div class="expiry-note">${icon('clock')} 最长 24 小时，到期后自动停止授权并清理。</div><div id="challenge"></div><p id="error" class="error-message" role="alert" hidden></p><button id="create" class="button primary wide" type="submit" disabled>生成分享链接 ${icon('arrows')}</button></form><div class="waiting-note">${icon('shield')} 有人点击下载后才开始传输，请保持分享页面打开。</div></section><aside id="how" class="how-panel"><span class="eyebrow">少一点中转，多一点直接</span><h2>一条链接，<br/>让文件找到对方。</h2><ol class="instructions"><li><span>1</span><div><strong>选择你想分享的文件</strong><p>原内容、原名称，每个文件完整交付。</p></div></li><li><span>2</span><div><strong>把链接发给对方</strong><p>复制链接或扫描二维码，无需注册。</p></div></li><li><span>3</span><div><strong>保持页面打开，等待接收</strong><p>下载开始后优先直连，必要时自动中继。</p></div></li></ol><div class="route-note"><div class="route-icons"><span>${icon('file')}</span><i></i><span class="route-middle">${icon('arrows')}</span><i></i><span>${icon('download')}</span></div><strong>能直传，就直接传</strong><p>直连不可用时依次尝试 TURN、WS 和 HTTPS 中继，所有路径都受服务额度限制。</p></div></aside></div>`);
+  shell(`<section class="hero"><div class="eyebrow"><span class="live-dot"></span> 让文件，直接抵达</div><h1>文件轻轻一传，<br/><span>分享就这么简单。</span></h1><p>无需注册，保留原文件。选择文件，生成链接，<br class="desktop-break"/>让下一次分享少一点麻烦。</p></section><div class="workspace"><section class="card upload-card"><div class="card-heading"><div><h2>创建一次临时分享</h2><p>从你的设备，传到对方的设备。</p></div><span class="step-label">01 / 开始分享</span></div><label class="dropzone" id="dropzone" for="file-input"><span class="upload-orbit">${icon('upload')}</span><strong>把文件拖到这里</strong><span>或点击选择文件 · 支持多文件</span><small id="file-limit">正在读取服务配置…</small><input id="file-input" type="file" multiple aria-label="选择分享文件"/></label><div id="selected-files" class="selected-files"></div><form id="create-form"><div class="expiry-field"><label for="hours">链接有效期<small>从创建分享时开始计时</small></label><div class="number-input"><input id="hours" name="expiresInHours" type="number" min="1" max="24" step="1" value="6" required inputmode="numeric"/><span>小时</span></div></div><div class="expiry-note">${icon('clock')} 最长 24 小时，到期后自动停止授权并清理。</div><div class="share-options"><label for="short-code">自定义短链接 <span>可选</span></label><div class="short-link-input"><span>/s/</span><input id="short-code" type="text" minlength="3" maxlength="32" pattern="[a-z0-9][a-z0-9_-]{2,31}" placeholder="例如 summer-files" autocomplete="off"/></div><small>3–32 位小写字母、数字、下划线或连字符，创建后不可修改。</small><label for="share-password">提取密码 <span>可选</span></label><input id="share-password" type="password" minlength="4" maxlength="64" autocomplete="new-password" placeholder="4–64 个字符"/><small>设置后接收者需要先验证密码，创建后不可修改。</small></div><div id="challenge"></div><p id="error" class="error-message" role="alert" hidden></p><button id="create" class="button primary wide" type="submit" disabled>生成分享链接 ${icon('arrows')}</button></form><div class="waiting-note">${icon('shield')} 有人点击下载后才开始传输，请保持分享页面打开。</div></section><aside id="how" class="how-panel"><span class="eyebrow">少一点中转，多一点直接</span><h2>一条链接，<br/>让文件找到对方。</h2><ol class="instructions"><li><span>1</span><div><strong>选择你想分享的文件</strong><p>原内容、原名称，每个文件完整交付。</p></div></li><li><span>2</span><div><strong>把链接发给对方</strong><p>复制链接或扫描二维码，无需注册。</p></div></li><li><span>3</span><div><strong>保持页面打开，等待接收</strong><p>下载开始后优先直连，必要时自动中继。</p></div></li></ol><div class="route-note"><div class="route-icons"><span>${icon('file')}</span><i></i><span class="route-middle">${icon('arrows')}</span><i></i><span>${icon('download')}</span></div><strong>能直传，就直接传</strong><p>直连不可用时依次尝试 TURN、WS 和 HTTPS 中继，所有路径都受服务额度限制。</p></div></aside></div>`);
   $('#file-input').onchange = () => { addFiles(Array.from($<HTMLInputElement>('#file-input').files ?? [])); $<HTMLInputElement>('#file-input').value = ''; };
   const zone = $('#dropzone'); zone.ondragover = event => { event.preventDefault(); zone.classList.add('dragging'); }; zone.ondragleave = () => zone.classList.remove('dragging');
   zone.ondrop = event => { event.preventDefault(); zone.classList.remove('dragging'); addFiles(Array.from(event.dataTransfer?.files ?? [])); };
@@ -96,22 +101,30 @@ async function create() {
   if (config.challengeRequired && !challengeToken) { error('请先完成人机验证'); return; }
   error(''); const button = $<HTMLButtonElement>('#create'); button.disabled = true; button.textContent = '正在创建分享…';
   try {
-    const result = await api<{ id: string; ownerToken: string; createdAt: number; expiresAt: number; files: FileInfo[] }>('/api/shares', undefined, { expiresInHours: hours, files: selected.map(file => ({ name: file.name, size: file.size, mime: file.type, lastModified: file.lastModified })), turnstileToken: challengeToken });
+    const shortCode = $<HTMLInputElement>('#short-code').value, password = $<HTMLInputElement>('#share-password').value;
+    const result = await api<{ id: string; shortCode?: string; passwordProtected: boolean; ownerToken: string; createdAt: number; expiresAt: number; files: FileInfo[]; url: string }>('/api/shares', undefined, { expiresInHours: hours, files: selected.map(file => ({ name: file.name, size: file.size, mime: file.type, lastModified: file.lastModified })), turnstileToken: challengeToken, ...(shortCode ? { shortCode } : {}), ...(password ? { password } : {}) });
+    createdPassword = password;
     ownerToken = result.ownerToken; result.files.forEach((file, index) => sources.set(file.id, selected[index]));
     selected = [];
     share = { ...result, status: 'active', cleanupStatus: 'pending', ownerStatus: 'online', activeRequests: 0 };
-    history.pushState({}, '', `/s/${result.id}#owner=${ownerToken}`); renderShare(); await startControl();
+    history.pushState({}, '', `${new URL(result.url).pathname}#owner=${ownerToken}`); renderShare(); await startControl();
   } catch (failure) { error(failure instanceof Error ? failure.message : '分享创建失败'); button.disabled = false; button.innerHTML = `生成分享链接 ${icon('arrows')}`; }
 }
 function renderShare() {
   if (!share) return;
-  const owner = Boolean(ownerToken), link = `${location.origin}/s/${share.id}`;
+  const owner = Boolean(ownerToken), link = `${location.origin}/s/${share.shortCode ?? share.id}`;
   shell(`<section class="share-hero"><div class="eyebrow"><span class="live-dot"></span> ${owner ? '让分享保持轻盈' : '一份文件，正在等你'}</div><h1>${owner ? '链接已备好，<span>等对方接收。</span>' : '收下文件，<span>继续你的事情。</span>'}</h1><p>${owner ? '只需分享下面的公开链接。此管理页面请自己保留。' : '每个文件独立保存，原内容、原名称，完整性全程校验。'}</p></section><div class="share-workspace"><section class="card share-card"><div class="card-heading"><div><h2>${owner ? '你的分享' : '收到的分享'}</h2><p><span id="owner-status">正在查询分享者状态…</span></p></div><span class="status-pill" id="connection">正在连接</span></div>${owner ? `<div class="link-panel"><label for="public-link">公开分享链接</label><div class="link-input"><input id="public-link" readonly value="${escape(link)}"/><button class="button primary" id="copy">${icon('copy')} 复制链接</button></div><div class="link-helper"><span>${icon('link')} 接收者打开链接后，点击下载即可。</span><button id="qr-toggle" class="text-button">显示二维码</button></div><div id="qr-panel" hidden><canvas id="qr" aria-label="公开分享链接二维码"></canvas><p>扫描接收文件</p></div></div>` : ''}<div class="files-heading"><strong>${share.files.length} 个文件</strong><span>共 ${size(share.files.reduce((n, file) => n + file.size, 0))}</span></div><div class="share-files">${share.files.map(file => `<div class="share-file" id="file-${file.id}"><div class="file-row">${fileTile(file, owner ? `<span class="file-state" id="state-${file.id}">${file.uploadStatus === 'ready' ? '云端可下载' : sources.has(file.id) ? '等待接收' : '需要重新选择'}</span>` : `<button class="button secondary download" data-file="${file.id}">${icon('download')} 下载原文件</button>`)}</div><div class="transfer-info" id="info-${file.id}"><span id="label-${file.id}">${owner ? '有人点击下载后才开始传输' : '尚未请求下载'}</span><span id="bytes-${file.id}"></span></div><progress id="progress-${file.id}" value="0" max="${file.size || 1}" hidden aria-label="${escape(file.name)} 传输进度"></progress><button class="text-button cancel" data-file="${file.id}" hidden>取消下载</button></div>`).join('')}</div><p id="error" class="error-message" role="alert" hidden></p>${owner ? `<div class="source-restore"><label class="button secondary" for="restore">${icon('file')} 重新选择源文件</label><input id="restore" type="file" multiple hidden/><small>刷新或休眠后，重新选择原文件即可恢复分享。</small></div>` : `<div class="browser-note">${icon('shield')} 大文件建议使用桌面 Chrome / Edge，直接流式保存到设备。</div>`}</section><aside class="share-aside"><div class="card expiry-card"><span class="soft-icon">${icon('clock')}</span><span class="eyebrow">链接剩余有效期</span><strong id="remaining" class="remaining">--:--:--</strong><p id="expires-date"></p><div class="divider"></div><p id="share-note">${owner ? '文件尚未上传到云端。请保持此页面可运行、设备联网；有人下载时才会传输。' : '直传和在线中继需要分享者在线；已就绪的云端文件可独立下载。'}</p>${owner ? `<button id="revoke" class="button danger wide">撤销此次分享</button>` : `<a href="/" class="button secondary wide">我也想分享文件 ${icon('arrows')}</a>`}</div><button class="text-button" id="reconnect" hidden>重新连接</button><div id="how" class="small-tip">${icon('shield')} 到期后停止新的访问授权，已保存到设备的文件仍由你保留。</div></aside></div>`);
   if (owner) {
     $('#copy').onclick = () => { void navigator.clipboard.writeText(link).then(() => toast('公开链接已复制')).catch(() => { $<HTMLInputElement>('#public-link').select(); toast('请复制已选中的公开链接'); }); };
     $('#qr-toggle').onclick = () => { const panel = $('#qr-panel'); panel.hidden = !panel.hidden; if (!panel.hidden) void QRCode.toCanvas($<HTMLCanvasElement>('#qr'), link, { width: 176, margin: 1, color: { dark: '#24385c', light: '#ffffff' } }); };
     $('#restore').onchange = () => { void restoreSources(Array.from($<HTMLInputElement>('#restore').files ?? [])); };
     $('#revoke').onclick = () => { void revoke(); };
+    if (createdPassword) {
+      const password = document.createElement('div'); password.className = 'share-password-summary';
+      password.innerHTML = '<span>已设置提取密码</span><button class="text-button" type="button">复制链接和提取密码</button>';
+      password.querySelector('button')!.onclick = () => { void navigator.clipboard.writeText(`链接：${link}\n提取密码：${createdPassword}`).then(() => toast('链接和提取密码已复制')).catch(() => error('复制失败，请手动复制链接和密码')); };
+      $('#public-link').closest('.link-panel')!.appendChild(password);
+    } else if (share.passwordProtected) { const note = document.createElement('p'); note.className = 'share-password-summary'; note.textContent = '此分享需要提取密码，刷新后本页不保留密码明文。'; $('#public-link').closest('.link-panel')!.appendChild(note); }
   } else {
     document.querySelectorAll<HTMLButtonElement>('.download').forEach(button => { button.onclick = () => { void download(button.dataset.file!); }; });
     document.querySelectorAll<HTMLButtonElement>('.cancel').forEach(button => { button.onclick = () => { const task = [...receivers.values()].find(x => x.task.fileId === button.dataset.file && !x.done); if (task) void task.cancel(); }; });
@@ -120,6 +133,30 @@ function renderShare() {
   clearInterval(expiryTimer); expiryTimer = setInterval(tick, 1000); tick(); updateShare(share);
   clearInterval(refreshTimer); refreshTimer = setInterval(() => { if (!ended) void refresh(); }, 12000);
   modes(); network();
+  for (const file of share.files) {
+    const row = document.createElement('div'); row.className = 'transfer-metrics';
+    row.innerHTML = `<span>当前方式：<strong id="transport-${file.id}">等待下载</strong></span><span>传输速度：<strong id="speed-${file.id}">0 B/s</strong></span>`;
+    $(`#file-${file.id}`).insertBefore(row, document.querySelector(`#progress-${file.id}`));
+  }
+  clearInterval(transferTimer); transferTimer = setInterval(updateTransferMetrics, 1000); updateTransferMetrics();
+}
+function updateTransferMetrics() {
+  if (!share) return;
+  for (const file of share.files) {
+    const metrics: { key: string; bytes: number; mode: string }[] = [];
+    if (ownerToken) {
+      for (const sender of senders.values()) if (sender.task.fileId === file.id && sender.active) metrics.push({ key: sender.task.transferId, bytes: sender.transferredBytes, mode: sender.task.mode });
+      const upload = uploads?.metric(file.id); if (upload) metrics.push(upload);
+    } else for (const receiver of receivers.values()) if (receiver.task.fileId === file.id && !receiver.done) metrics.push({ key: receiver.task.transferId, bytes: receiver.transferredBytes, mode: receiver.task.mode });
+    let speed = 0;
+    for (const metric of metrics) { if (!speedMeters.has(metric.key)) speedMeters.set(metric.key, new TransferSpeed()); speed += speedMeters.get(metric.key)!.sample(metric.key, metric.bytes); }
+    const modes = [...new Set(metrics.map(metric => MODE_LABELS[metric.mode] ?? metric.mode))];
+    const mode = document.querySelector(`#transport-${file.id}`), rate = document.querySelector(`#speed-${file.id}`);
+    if (mode) mode.textContent = modes.length ? modes.join(' + ') : lastModes.get(file.id) ?? '等待下载';
+    if (rate) rate.textContent = `${size(Math.round(speed))}/s`;
+  }
+  const active = new Set([...senders.values()].filter(sender => sender.active).map(sender => sender.task.transferId).concat([...receivers.values()].filter(receiver => !receiver.done).map(receiver => receiver.task.transferId), share.files.map(file => uploads?.metric(file.id)?.key).filter((key): key is string => Boolean(key))));
+  for (const key of speedMeters.keys()) if (!active.has(key)) speedMeters.delete(key);
 }
 function tick() {
   if (!share || !document.querySelector('#remaining')) return;
@@ -155,7 +192,8 @@ async function refresh() {
 }
 const progress: Progress = (fileId, label, bytes, mode, finished) => {
   if (!document.querySelector(`#file-${fileId}`)) return;
-  $(`#label-${fileId}`).textContent = `${mode ? ({ p2p: '直连', turn: 'TURN', ws: 'WS 中继', https: 'HTTPS 中继', r2: '云端' } as Record<string, string>)[mode] + ' · ' : ''}${label}`;
+  $(`#label-${fileId}`).textContent = label;
+  if (mode) { lastModes.set(fileId, MODE_LABELS[mode] ?? mode); const method = document.querySelector(`#transport-${fileId}`); if (method) method.textContent = MODE_LABELS[mode] ?? mode; }
   $(`#bytes-${fileId}`).textContent = bytes ? size(bytes) : '';
   const bar = $<HTMLProgressElement>(`#progress-${fileId}`); bar.hidden = false; bar.value = finished && !share!.files.find(file => file.id === fileId)!.size ? 1 : bytes;
   const cancel = document.querySelector<HTMLButtonElement>(`.cancel[data-file="${fileId}"]`); if (cancel) cancel.hidden = Boolean(finished) || label.startsWith('未完成');
@@ -275,17 +313,26 @@ async function main() {
   presence(); const presenceTimer = setInterval(presence, 30000); window.addEventListener('pagehide', () => clearInterval(presenceTimer), { once: true });
   if (location.pathname === '/admin' || location.pathname === '/admin/') { await adminMain(); return; }
   window.addEventListener('focus', () => { void (async () => { if (!config) return; try { const next = await api<PublicConfig>('/api/config'); if (next.admin !== config.admin) { config = next; const link = document.querySelector<HTMLAnchorElement>('.header-link'); if (link) link.textContent = config.admin ? '管理台 · 已登录' : '管理登录'; if (config.admin) modes(); else document.querySelectorAll('.mode-choice').forEach(x => x.remove()); network(); } } catch { /* 原有传输继续运行，后端仍验证授权。 */ } })(); });
-  const match = location.pathname.match(/^\/s\/([a-f0-9]{32})$/);
+  const match = location.pathname.match(/^\/s\/([a-z0-9_-]{3,32})$/);
   if (!match) renderHome(); else shell('<section class="hero"><div class="eyebrow">临时传</div><h1>正在读取分享…</h1><p id="error" class="error-message" role="alert" hidden></p></section>');
   try {
     config = await api<PublicConfig>('/api/config');
     if (!match) { renderHome(); $('#file-limit').textContent = `单文件最高 ${size(config.limits.maxFileBytes)} · 总计最高 ${size(config.limits.maxShareBytes)}`; network(); void setupChallenge(); return; }
     ownerToken = new URLSearchParams(location.hash.slice(1)).get('owner') ?? undefined;
     if (ownerToken && !/^[a-f0-9]{64}$/.test(ownerToken)) ownerToken = undefined;
-    try { share = await api<ShareInfo>(`/api/shares/${match[1]}`); }
-    catch (failure) { if (failure instanceof ApiError && failure.status === 410 && (failure.details as { share?: ShareInfo })?.share) share = (failure.details as { share: ShareInfo }).share; else throw failure; }
+    try { share = await api<ShareInfo>(`/api/shares/${match[1]}`, ownerToken); }
+    catch (failure) {
+      if (failure instanceof ApiError && failure.code === 'password_required') { renderUnlock(match[1]); return; }
+      if (failure instanceof ApiError && failure.status === 410 && (failure.details as { share?: ShareInfo })?.share) share = (failure.details as { share: ShareInfo }).share; else throw failure;
+    }
     renderShare(); if (!ended) await startControl();
   } catch (failure) { error(failure instanceof Error ? failure.message : '服务暂时不可用'); }
 }
-window.addEventListener('pagehide', () => { peers?.stop(); control?.stop(); uploads?.stop(); for (const sender of senders.values()) sender.stop(); });
+function renderUnlock(reference: string) {
+  shell('<section class="card share-unlock"><span class="eyebrow">受密码保护的分享</span><h1>输入提取密码</h1><p>验证后即可查看文件并下载。</p><form id="unlock-form"><label for="extraction-password">提取密码</label><input id="extraction-password" type="password" minlength="4" maxlength="64" autocomplete="off" required autofocus/><button class="button primary" type="submit">查看文件</button></form><p id="error" class="error-message" role="alert" hidden></p></section>');
+  $('#unlock-form').onsubmit = event => { event.preventDefault(); const button = $('#unlock-form button') as HTMLButtonElement; button.disabled = true;
+    void (async () => { try { await api(`/api/shares/${reference}/unlock`, undefined, { password: $<HTMLInputElement>('#extraction-password').value }); share = await api<ShareInfo>(`/api/shares/${reference}`); renderShare(); await startControl(); } catch (failure) { error(failure instanceof Error ? failure.message : '验证失败'); button.disabled = false; } })();
+  };
+}
+window.addEventListener('pagehide', () => { clearInterval(transferTimer); peers?.stop(); control?.stop(); uploads?.stop(); for (const sender of senders.values()) sender.stop(); });
 void main();

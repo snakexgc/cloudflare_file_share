@@ -73,6 +73,32 @@ export async function adminApi(request: Request, env: Env, source: string, hash?
   const bearerBudget = path === '/api/admin/budget' && env.ADMIN_TOKEN && constantEqual(digest(request.headers.get('Authorization') ?? ''), digest(`Bearer ${env.ADMIN_TOKEN}`));
   assert(hash || bearerBudget, 403, 'admin_forbidden', '请先在 /admin 登录');
   if (path === '/api/admin/budget' && request.method === 'GET') return json(await budget(env, '/snapshot', {}));
+  if (path === '/api/admin/bulk' && request.method === 'POST') {
+    const data = await readJson(request, 16384), action = data.action;
+    assert(['revoke-shares', 'delete-files', 'set-mode', 'cancel-requests'].includes(String(action)), 400, 'invalid_bulk_action', '批量操作类型无效');
+    assert(Array.isArray(data.targets) && data.targets.length > 0 && data.targets.length <= 50, 400, 'invalid_bulk_targets', '每批请选择 1–50 个对象');
+    const targets = data.targets.map((input: unknown) => {
+      assert(input && typeof input === 'object' && !Array.isArray(input), 400, 'invalid_bulk_target', '操作对象无效');
+      const target = input as Record<string, unknown>;
+      assert(typeof target.shareId === 'string' && ID_PATTERN.test(target.shareId), 400, 'invalid_bulk_target', '分享 ID 无效');
+      if (action === 'delete-files' || action === 'set-mode') assert(typeof target.fileId === 'string' && ID_PATTERN.test(target.fileId), 400, 'invalid_bulk_target', '文件 ID 无效');
+      if (action === 'cancel-requests') assert(typeof target.requestId === 'string' && ID_PATTERN.test(target.requestId), 400, 'invalid_bulk_target', '任务 ID 无效');
+      return { shareId: target.shareId, ...(action === 'delete-files' || action === 'set-mode' ? { fileId: target.fileId as string } : {}), ...(action === 'cancel-requests' ? { requestId: target.requestId as string } : {}) };
+    });
+    assert(new Set(targets.map(target => `${target.shareId}:${target.fileId ?? target.requestId ?? ''}`)).size === targets.length, 400, 'duplicate_bulk_target', '批量操作中存在重复对象');
+    if (action === 'set-mode') assert(['auto', 'p2p', 'turn', 'ws', 'https', 'r2'].includes(String(data.mode)), 400, 'invalid_mode', '传输方式无效');
+    const results: { target: typeof targets[number]; ok: boolean; status: number; message?: string; cleanupPending?: boolean }[] = [];
+    for (let offset = 0; offset < targets.length; offset += 5) {
+      const settled = await Promise.allSettled(targets.slice(offset, offset + 5).map(async target => {
+        const route = action === 'revoke-shares' ? 'revoke' : action === 'cancel-requests' ? `requests/${target.requestId}` : `files/${target.fileId}${action === 'set-mode' ? '/mode' : ''}`;
+        const response = await managedRoom(env, target.shareId, new Request(`https://room/internal/admin/${route}`, { method: action === 'set-mode' ? 'POST' : 'DELETE', headers: { 'X-File-Share-Admin': hash!, ...(action === 'set-mode' ? { 'Content-Type': 'application/json' } : {}) }, body: action === 'set-mode' ? JSON.stringify({ mode: data.mode }) : undefined }));
+        const result = await response.json<{ message?: string; cleanupPending?: boolean }>();
+        return { target, ok: response.ok, status: response.status, message: result.message, cleanupPending: result.cleanupPending };
+      }));
+      settled.forEach((result, index) => results.push(result.status === 'fulfilled' ? result.value : { target: targets[offset + index], ok: false, status: 503, message: '服务暂时不可用，请重试此项' }));
+    }
+    return json({ results, succeeded: results.filter(result => result.ok).length, failed: results.filter(result => !result.ok).length });
+  }
   if (path === '/api/admin/overview' && request.method === 'GET') {
     const [ledger, totals, online, rooms] = await Promise.all([
       budget(env, '/snapshot', {}),

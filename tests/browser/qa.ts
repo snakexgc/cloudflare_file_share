@@ -8,6 +8,7 @@ import { FRAME_HEADER_BYTES, WS_DEFAULT_PAYLOAD_BYTES, WS_MAX_MESSAGE_BYTES } fr
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { rtcSupport } from '../../src/client/rtc';
+import { MODE_LABELS, TransferSpeed } from '../../src/client/speed';
 
 interface Handle { createWritable(): Promise<FileWriter>; getFile(): Promise<File> }
 interface Directory { getFileHandle(name: string, options: { create: boolean }): Promise<Handle>; removeEntry(name: string): Promise<void> }
@@ -24,6 +25,7 @@ async function run(mode: string) {
   const senders = new Map<string, SendTask>();
   let discovery: ReturnType<typeof setInterval> | undefined, extraControl: ControlSession | undefined, extraTask: ReceiveTask | undefined, extraName = '';
   let overlap = false;
+  let speedTimer: ReturnType<typeof setInterval> | undefined, peakSpeed = 0;
   try {
     if (useHttps && !mixed) { globalThis.WebSocket = undefined as unknown as typeof WebSocket; globalThis.RTCPeerConnection = undefined as unknown as typeof RTCPeerConnection; log('已禁用 WebSocket 和 RTCPeerConnection 构造器'); }
     const support = rtcSupport(); log(`当前页面 RTCPeerConnection 类型：${support.constructorType}；可创建数据连接：${support.available}`);
@@ -81,7 +83,9 @@ async function run(mode: string) {
     if (mixed) discovery = setInterval(() => { void owner!.refreshStatus().catch(failed); }, 1200);
     directory = await (navigator.storage as unknown as { getDirectory(): Promise<Directory> }).getDirectory();
     savedName = `qa-${created.id}.bin`; const handle = await directory.getFileHandle(savedName, { create: true });
-    sink = new VerifiedSink(created.files[0], await handle.createWritable());
+    const nativeWriter = await handle.createWritable();
+    const measuredWriter: FileWriter = mode === 'https-speed' ? { write: async bytes => { await delay(2000); await nativeWriter.write(bytes); }, truncate: size => nativeWriter.truncate(size), seek: position => nativeWriter.seek(position), close: () => nativeWriter.close(), abort: () => nativeWriter.abort() } : nativeWriter;
+    sink = new VerifiedSink(created.files[0], measuredWriter);
     const task = await api<DownloadRequest>(`${receiver.base}/download-requests`, receiver.sessionToken, { fileId: created.files[0].id });
     log(`实际传输模式：${task.mode}`);
     receiveTask = new ReceiveTask(task, sink, receiver, config.limits, config.stunServers, (_fileId, label, bytes, actualMode, done) => {
@@ -90,6 +94,16 @@ async function run(mode: string) {
       else if (label.includes('切换') || label.includes('连接')) log(`${actualMode}：${label}`);
     });
     await receiveTask.start(); for (const event of queue) await receiveTask.event(event);
+    if (mode === 'https-speed') {
+      const uploadSpeed = new TransferSpeed(), downloadSpeed = new TransferSpeed();
+      const status = document.createElement('p'); status.id = 'speed-status'; output.parentElement!.insertBefore(status, output);
+      speedTimer = setInterval(() => {
+        const sent = senderTask ? uploadSpeed.sample(senderTask.task.transferId, senderTask.transferredBytes) : 0;
+        const received = downloadSpeed.sample(receiveTask!.task.transferId, receiveTask!.transferredBytes);
+        peakSpeed = Math.max(peakSpeed, sent, received);
+        status.textContent = `当前方式：${MODE_LABELS[receiveTask!.task.mode]} · 上传 ${(sent / 1024 ** 2).toFixed(2)} MiB/s · 下载 ${(received / 1024 ** 2).toFixed(2)} MiB/s`;
+      }, 250);
+    }
     const extraFinished: Promise<void>[] = [];
     if (mixed) {
       extraControl = new ControlSession(shareId, 'receiver', { ws: true, webrtc: false, https: false, readable: [] }, config.limits); extraControl.busy = () => true;
@@ -110,6 +124,7 @@ async function run(mode: string) {
     await Promise.race([Promise.all([finished, settled, ...extraFinished]), timedOut]); clearTimeout(deadline);
     if (mode.startsWith('rtc') && receiveTask.task.mode !== 'p2p') throw new Error(`原定 WebRTC 传输回退到了 ${receiveTask.task.mode}；不能视为直连通过`);
     if (useHttps && receiveTask.task.mode !== 'https') throw new Error(`HTTPS 测试使用了 ${receiveTask.task.mode}`);
+    if (mode === 'https-speed') { if (peakSpeed <= 0) throw new Error('真实传输未取得非零速度样本'); log(`传输速度样本峰值：${(peakSpeed / 1024 ** 2).toFixed(2)} MiB/s（本地网络，非公网性能测量）`); }
     const actual = new Uint8Array(await (await handle.getFile()).arrayBuffer()), expectedHash = bytesToHex(sha256(source)), actualHash = bytesToHex(sha256(actual));
     if (actual.length !== source.length || actualHash !== expectedHash) throw new Error('重新读取保存文件后哈希不匹配');
     if (mode === 'ws-large') {
@@ -121,6 +136,7 @@ async function run(mode: string) {
   } catch (error) { log(`FAIL：${error instanceof Error ? error.message : String(error)}`); }
   finally {
     clearTimeout(deadline); await sink?.abort().catch(() => {});
+    clearInterval(speedTimer);
     clearInterval(discovery); for (const sender of senders.values()) sender.stop(); await receiveTask?.cancel().catch(() => {}); await extraTask?.cancel().catch(() => {}); extraControl?.stop(); owner?.stop(); receiver?.stop();
     if (shareId && ownerToken) await api(`/api/shares/${shareId}`, ownerToken, undefined, 'DELETE').catch(() => {});
     if (savedName && directory) await directory.removeEntry(savedName).catch(() => {});

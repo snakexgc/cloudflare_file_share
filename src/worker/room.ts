@@ -8,10 +8,14 @@ import { findMultipartUploads, listParts, presign, r2Configured, validateParts }
 import { generateTurn, revokeTurn } from './turn';
 import { meteredDB } from './db';
 import { closeHttpsRoom, HttpsRelay } from './https-relay';
+import { accessCookie, accessCookieName, createSharePassword, verifySharePassword, type SharePassword } from './share-access';
 
 interface StoredFile extends FileInfo { r2Key?: string; modeAdminHash?: string }
 interface Room {
   id: string;
+  shortCode?: string;
+  passwordHash?: SharePassword;
+  accessGrants?: { hash: string; expiresAt: number }[];
   ownerTokenHash: string;
   sourceHash: string;
   createdAt: number;
@@ -70,13 +74,23 @@ export class ShareRoom extends DurableObject<Env> {
   }
   private snapshot(): ShareInfo {
     const state = this.state(), owner = this.owner();
-    return { id: state.id, createdAt: state.createdAt, expiresAt: state.expiresAt, status: state.status === 'active' && Date.now() >= state.expiresAt ? 'expired' : state.status,
+    return { id: state.id, shortCode: state.shortCode, passwordProtected: Boolean(state.passwordHash), createdAt: state.createdAt, expiresAt: state.expiresAt, status: state.status === 'active' && Date.now() >= state.expiresAt ? 'expired' : state.status,
       cleanupStatus: state.cleanupStatus, ownerStatus: !owner ? 'offline' : owner.capabilities.readable.length ? 'online' : 'file_unavailable',
       activeRequests: state.requests.filter(active).length, files: state.files.filter(x => !x.deleted).map(({ r2Key: _r2Key, modeAdminHash: _modeAdminHash, ...file }) => file) };
   }
   private ensureActive() {
     const state = this.state();
     if (state.status !== 'active' || Date.now() >= state.expiresAt) throw new HttpError(410, 'share_expired', state.status === 'revoked' ? '分享已撤销' : '分享已过期', { share: this.snapshot() });
+  }
+  private async ensureAccess(request: Request) {
+    const state = this.state(); if (!state.passwordHash) return;
+    const secret = bearer(request), hash = digest(secret);
+    if (secret && (constantEqual(hash, state.ownerTokenHash) || [...this.sessions.values()].some(session => constantEqual(hash, session.tokenHash)))) return;
+    if (await validAdmin(this.env, request.headers.get('X-File-Share-Admin') ?? undefined)) return;
+    const value = request.headers.get('Cookie')?.split(';').map(item => item.trim()).find(item => item.startsWith(`${accessCookieName(state.id)}=`))?.split('=')[1];
+    if (value && /^[a-f0-9]{64}$/.test(value) && state.accessGrants?.some(grant => grant.expiresAt > Date.now() && constantEqual(grant.hash, digest(value)))) return;
+    const expired = state.status !== 'active' || Date.now() >= state.expiresAt;
+    throw new HttpError(expired ? 410 : 401, expired ? 'share_expired' : 'password_required', expired ? '分享已结束' : '请输入提取密码', { id: state.id, shortCode: state.shortCode, expiresAt: state.expiresAt });
   }
   private session(request: Request, allowExpired = false) {
     if (!allowExpired) this.ensureActive();
@@ -558,13 +572,19 @@ export class ShareRoom extends DurableObject<Env> {
         const path = new URL(request.url).pathname, method = request.method;
         if (path === '/internal/init') {
           assert(!this.room, 409, 'already_initialized', '分享已创建');
-          this.room = await readJson<Room>(request); await this.persist(); return json({ ok: true });
+          const { password, ...initial } = await readJson<Room & { password?: unknown }>(request);
+          this.room = { ...initial, passwordHash: await createSharePassword(password) }; await this.persist(); return json({ ok: true });
         }
         if (path === '/internal/sweep') { await this.sweep(); await this.persist(); return json({ ok: true }); }
         if (path === '/internal/admin/ws-usage') return json({ transfers: [...this.relays.values()].map(relay => ({ id: this.state().requests.find(task => task.id === relay.requestId)?.reservationId, bytes: relay.bytes })) });
         if (path === '/internal/admin/https-usage') return json({ transfers: this.state().requests.filter(task => task.mode === 'https' && active(task) && task.reservationId).map(task => ({ id: task.reservationId, bytes: Math.max(task.httpsBytes ?? 0, this.httpsRelays.get(task.transferId)?.bytes ?? 0), activeMs: Math.max(0, Date.now() - (task.httpsStartedAt ?? Date.now())) })) });
         if (path === '/internal/admin/snapshot') return json({ ...this.snapshot(), files: this.state().files.map(({ modeAdminHash: _hash, ...file }) => file), sessions: [...this.sessions.values()].filter(s => this.online(s)).map(s => ({ id: s.id, role: s.role, lastSeen: this.seenAt(s), capabilities: s.capabilities })), requests: this.state().requests.map(({ adminGrant: _grant, ...task }) => task) });
         if (path === '/internal/admin/revoke' && method === 'DELETE') { this.state().status = 'revoked'; await this.cleanup(); await this.persist(); return json({ ok: true }); }
+        const cancelRequest = path.match(/^\/internal\/admin\/requests\/([a-f0-9]{32})$/);
+        if (cancelRequest && method === 'DELETE') {
+          const task = this.state().requests.find(task => task.id === cancelRequest[1]); assert(task, 404, 'request_not_found', '传输任务不存在');
+          if (active(task)) await this.cancelTask(task, '管理员取消传输'); await this.persist(); return json({ ok: true });
+        }
         const adminMode = path.match(/^\/internal\/admin\/files\/([a-f0-9]{32})\/mode$/);
         if (adminMode && method === 'POST') {
           const hash = request.headers.get('X-File-Share-Admin'), data = await readJson(request);
@@ -584,6 +604,19 @@ export class ShareRoom extends DurableObject<Env> {
         }
         const base = `/api/shares/${this.state().id}`, route = path.slice(base.length);
         assert(path.startsWith(base), 404, 'not_found', '接口不存在');
+        if (route === '/unlock' && method === 'POST') {
+          const state = this.state(), expired = state.status !== 'active' || Date.now() >= state.expiresAt;
+          assert(!expired, 410, 'share_expired', '分享已结束');
+          if (!state.passwordHash) return json({ unlocked: true });
+          await budget(this.env, '/share-unlock', { source: request.headers.get('X-File-Share-Source') ?? 'local', shareId: state.id });
+          const data = await readJson(request, 1024);
+          assert(await verifySharePassword(data.password, state.passwordHash), 403, 'invalid_share_password', '提取密码错误');
+          state.accessGrants = (state.accessGrants ?? []).filter(grant => grant.expiresAt > Date.now());
+          assert(state.accessGrants.length < 64, 429, 'share_access_limit', '此分享的访问授权已满');
+          const secret = token(); state.accessGrants.push({ hash: digest(secret), expiresAt: state.expiresAt }); await this.persist();
+          const response = json({ unlocked: true }); response.headers.set('Set-Cookie', accessCookie(request, state.id, secret, state.expiresAt)); return response;
+        }
+        if (route === '' && method === 'GET' || route === '/sessions' && method === 'POST') await this.ensureAccess(request);
         if (route === '' && method === 'GET') { this.ensureActive(); return json(this.snapshot()); }
         if (route === '' && method === 'DELETE') { this.ownerAuth(request, true); if (this.state().status === 'active') this.state().status = 'revoked'; await this.cleanup(); await this.persist(); return json({ share: this.snapshot() }); }
         if (route === '/sessions' && method === 'POST') {
@@ -905,6 +938,7 @@ export class ShareRoom extends DurableObject<Env> {
       await budget(this.env, '/release', { id: `share:${state.id}` });
       if (state.files.length) await this.env.DB.prepare('DELETE FROM files WHERE share_id = ?').bind(state.id).run();
       state.files = []; state.requests = [];
+      state.accessGrants = []; delete state.passwordHash;
       for (const session of this.sessions.values()) { session.events = []; session.seen = []; session.capabilities = { ws: false, webrtc: false, readable: [] }; this.dirty.add(session.id); }
       // 仅保留期限、授权哈希及补偿清理所需的 key 清单；不保留文件名称和 SHA-256。
     }

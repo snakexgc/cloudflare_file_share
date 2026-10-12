@@ -117,6 +117,11 @@ export class TURNBudget extends DurableObject<Env> {
             if (!rate || rate.resetAt <= now) this.ledger.rates[key] = { count: 1, resetAt: now + 900000 };
             else { assert(rate.count < maximum, 429, 'login_rate', '登录尝试过多，请 15 分钟后重试'); rate.count++; }
           }
+        } else if (path === '/share-unlock') {
+          const key = `share-unlock:${String(data.shareId)}:${String(data.source)}`, entry = this.ledger.rates[key];
+          assert(Object.keys(this.ledger.rates).length < 5000 || entry, 429, 'rate_capacity', '当前访问过多');
+          if (!entry || entry.resetAt <= now) this.ledger.rates[key] = { count: 1, resetAt: now + 900000 };
+          else { assert(entry.count < 5, 429, 'share_password_rate', '提取密码尝试过多，请 15 分钟后重试'); entry.count++; }
         } else if (path === '/d1-used') {
           const read = Number(data.read), written = Number(data.written);
           assert(Number.isSafeInteger(read) && read >= 0 && Number.isSafeInteger(written) && written >= 0, 400, 'invalid_usage', 'D1 使用量无效');

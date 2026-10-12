@@ -5,6 +5,7 @@ import { ControlSession } from '../src/client/control';
 import { ReceiveTask, SendTask } from '../src/client/transfer';
 import { VerifiedSink, type FileWriter } from '../src/client/sink';
 import { HttpsRelay } from '../src/worker/https-relay';
+import { httpsFetch } from '../src/client/https';
 import { defaults } from '../src/worker/config';
 import type { DownloadRequest, FileInfo } from '../src/shared/types';
 import { id } from '../src/worker/util';
@@ -19,6 +20,22 @@ function objects(size: number) {
   const control = { base: '/api/shares/test', sessionToken: 'token', track: vi.fn(), signal: vi.fn() } as unknown as ControlSession;
   return { file, task, saved, writer, control };
 }
+it('HTTPS 上传使用真实字节进度，上传完成仍等待服务器写入 ACK', async () => {
+  let request!: FakeRequest;
+  class FakeRequest {
+    upload: { onprogress?: (event: { loaded: number }) => void } = {};
+    status = 200; responseText = '{"offset":4}'; timeout = 0;
+    onload?: () => void; onerror?: () => void; onabort?: () => void; ontimeout?: () => void;
+    open = vi.fn(); setRequestHeader = vi.fn(); send = vi.fn(); abort = vi.fn();
+    constructor() { request = this; }
+  }
+  vi.stubGlobal('XMLHttpRequest', FakeRequest);
+  const f = objects(4), progress = vi.fn(), signal = new AbortController().signal; let settled = false;
+  const result = httpsFetch(f.control, f.task, 'chunk', 0, signal, 300000, new Blob([new Uint8Array(4)]), 2, progress).then(response => { settled = true; return response; });
+  request.upload.onprogress?.({ loaded: 2 }); request.upload.onprogress?.({ loaded: 4 });
+  expect(progress.mock.calls.map(call => call[0])).toEqual([0, 2, 4]); expect(settled).toBe(false); expect(request.open).toHaveBeenCalledWith('POST', expect.stringContaining('/https/chunk'));
+  request.onload?.(); expect(await (await result).json()).toEqual({ offset: 4 }); expect(settled).toBe(true); expect(fetch).not.toHaveBeenCalled();
+});
 it.each([0, 49])('没有 WebSocket / WebRTC 时仍输出完整 %s 字节源文件，ACK 响应丢失不会重复写入', async size => {
   vi.stubGlobal('WebSocket', undefined); vi.stubGlobal('RTCPeerConnection', undefined);
   const f = objects(size), data = Uint8Array.from({ length: size }, (_, i) => i * 17 % 256), source = new File([data], f.file.name);

@@ -6,6 +6,7 @@ import { generateTurn, turnConfiguration } from './turn';
 import { ID_PATTERN, validHours } from '../shared/protocol';
 import { r2Configured } from './r2';
 import { meteredDB } from './db';
+import { validShortCode } from './share-access';
 export { ShareRoom } from './room';
 export { TURNBudget } from './budget';
 
@@ -17,6 +18,8 @@ const securityHeaders = {
 };
 async function createShare(request: Request, env: Env, source: string) {
   const conf = limits(env), data = await readJson(request, conf.controlMaxBytes);
+  assert(data.shortCode === undefined || validShortCode(data.shortCode), 400, 'invalid_short_code', '短链接须为 3–32 位小写字母、数字、下划线或连字符，且不能使用文件分享 ID');
+  assert(data.password === undefined || typeof data.password === 'string' && data.password.length >= 4 && data.password.length <= 64 && !/[\x00-\x1f\x7f]/.test(data.password), 400, 'invalid_share_password', '提取密码须为 4–64 个字符，不接受控制字符');
   assert(validHours(data.expiresInHours), 400, 'invalid_expiry', '有效期必须是 1–24 小时的整数');
   assert(Array.isArray(data.files) && data.files.length >= 1 && data.files.length <= conf.maxFiles, 400, 'invalid_files', `请选择 1–${conf.maxFiles} 个文件`);
   let total = 0;
@@ -41,18 +44,20 @@ async function createShare(request: Request, env: Env, source: string) {
   await budget(env, '/reserve', { id: `share:${shareId}`, kind: 'share', bytes: 0, source, expiresAt });
   try {
     await env.DB.batch([
-      env.DB.prepare('INSERT INTO shares (id, owner_token_hash, source_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)').bind(shareId, digest(ownerToken), source, createdAt, expiresAt),
+      env.DB.prepare('INSERT INTO shares (id, owner_token_hash, source_hash, created_at, expires_at, short_code) VALUES (?, ?, ?, ?, ?, ?)').bind(shareId, digest(ownerToken), source, createdAt, expiresAt, data.shortCode ?? null),
       ...files.map(f => env.DB.prepare('INSERT INTO files (id, share_id, name, size_bytes, mime, last_modified) VALUES (?, ?, ?, ?, ?, ?)').bind(f.id, shareId, f.name, f.size, f.mime, f.lastModified)),
     ]);
     await budget(env, '/do-used', { count: 1 });
     const response = await env.ROOMS.get(env.ROOMS.idFromName(shareId)).fetch(new Request('https://room/internal/init', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: shareId, ownerTokenHash: digest(ownerToken), sourceHash: source, createdAt, expiresAt, status: 'active', cleanupStatus: 'pending', files, requests: [], uploads: [], pendingRevocations: [] }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: shareId, shortCode: data.shortCode, password: data.password, ownerTokenHash: digest(ownerToken), sourceHash: source, createdAt, expiresAt, status: 'active', cleanupStatus: 'pending', files, requests: [], uploads: [], pendingRevocations: [] }),
     }));
-    assert(response.ok, 503, 'share_initialization_failed', '分享初始化失败，请重试');
-    return json({ id: shareId, ownerToken, createdAt, expiresAt, files, url: `${new URL(request.url).origin}/s/${shareId}` }, 201);
+    if (!response.ok) { const error = await response.json<{ error: string; message: string }>(); assert(false, response.status, error.error, error.message); }
+    return json({ id: shareId, shortCode: data.shortCode, passwordProtected: data.password !== undefined, ownerToken, createdAt, expiresAt, files, url: `${new URL(request.url).origin}/s/${data.shortCode ?? shareId}` }, 201);
   } catch (error) {
     await env.DB.prepare('DELETE FROM shares WHERE id = ?').bind(shareId).run();
-    await budget(env, '/release', { id: `share:${shareId}` }); throw error;
+    await budget(env, '/release', { id: `share:${shareId}` });
+    if (String(error).includes('UNIQUE constraint failed: shares.short_code')) assert(false, 409, 'short_code_taken', '这个短链接已被使用，请换一个');
+    throw error;
   }
 }
 async function handle(request: Request, env: Env): Promise<Response> {
@@ -71,7 +76,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
     }
     if (url.pathname === '/api/presence' && request.method === 'POST') {
       const data = await readJson(request, 1024);
-      assert(typeof data.id === 'string' && ID_PATTERN.test(data.id) && typeof data.page === 'string' && /^(\/|\/admin|\/s\/[a-f0-9]{32})$/.test(data.page), 400, 'invalid_presence', '在线状态无效');
+      assert(typeof data.id === 'string' && ID_PATTERN.test(data.id) && typeof data.page === 'string' && /^(\/|\/admin|\/s\/[a-z0-9_-]{3,32})$/.test(data.page), 400, 'invalid_presence', '在线状态无效');
       await env.DB.prepare('INSERT INTO presence (id, page, last_seen) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET page = excluded.page, last_seen = excluded.last_seen').bind(data.id, data.page, Date.now()).run();
       return json({ ok: true });
     }
@@ -98,11 +103,15 @@ async function handle(request: Request, env: Env): Promise<Response> {
       await budget(env, '/r2-operation', { kind: 'A' }); await env.BUCKET.list({ prefix: 'temporary/', limit: 1 }); return json({ ok: true });
     }
     if (url.pathname === '/api/shares' && request.method === 'POST') return createShare(request, env, source);
-    const match = url.pathname.match(/^\/api\/shares\/([a-f0-9]{32})(?:\/|$)/);
-    assert(match && ID_PATTERN.test(match[1]), 404, 'not_found', '接口不存在');
+    const match = url.pathname.match(/^\/api\/shares\/([a-z0-9_-]{3,32})(?:\/|$)/);
+    assert(match && (ID_PATTERN.test(match[1]) || validShortCode(match[1])), 404, 'not_found', '接口不存在');
+    const shareId = ID_PATTERN.test(match[1]) ? match[1] : await env.DB.prepare('SELECT id FROM shares WHERE short_code = ?').bind(match[1]).first<string>('id');
+    assert(shareId, 404, 'share_not_found', '分享不存在');
+    url.pathname = url.pathname.replace(`/api/shares/${match[1]}`, `/api/shares/${shareId}`);
     const headers = new Headers(request.headers); headers.delete('X-File-Share-Admin');
+    headers.set('X-File-Share-Source', source);
     if (admin) headers.set('X-File-Share-Admin', admin);
-    return env.ROOMS.get(env.ROOMS.idFromName(match[1])).fetch(new Request(request, { headers }));
+    return env.ROOMS.get(env.ROOMS.idFromName(shareId)).fetch(new Request(url, { method: request.method, headers, body: request.body, redirect: request.redirect, signal: request.signal }));
   }
   assert(request.method === 'GET' || request.method === 'HEAD', 405, 'method_not_allowed', '页面仅支持 GET 或 HEAD');
   return env.ASSETS.fetch(request);

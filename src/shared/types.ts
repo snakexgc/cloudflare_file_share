@@ -14,6 +14,8 @@ export interface FileInfo {
 }
 export interface ShareInfo {
   id: string;
+  shortCode?: string;
+  passwordProtected?: boolean;
   createdAt: number;
   expiresAt: number;
   status: 'active' | 'expired' | 'revoked';

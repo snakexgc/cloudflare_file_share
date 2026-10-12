@@ -25,9 +25,11 @@ export class SendTask {
   private ready = false;
   private running = false;
   private lastAck = Date.now();
+  private uploaded = 0;
   constructor(public task: DownloadRequest, private file: File, private control: ControlSession, private conf: Limits, private stun: IceServer[], private progress: Progress, private direct?: DirectTransport) { this.acked = this.sent = task.offset; }
   async start() {
     try {
+      this.progress(this.task.fileId, '准备发送', this.acked, this.task.mode);
       try { await this.file.slice(0, Math.min(1, this.file.size)).arrayBuffer(); } catch { throw new SourceReadError('本地文件不可读，请重新选择原文件'); }
       if (this.task.mode === 'https') { this.control.track(this.task); void this.runHttps(); return; }
       if (this.task.mode === 'ws') { void this.run(); return; }
@@ -115,7 +117,7 @@ export class SendTask {
             hash.update(bytes);
           }
         } catch (error) { this.check(); throw new SourceReadError(messageOf(error)); }
-        const response = await httpsFetch(this.control, this.task, 'chunk', this.sent, this.abort.signal, this.conf.ackTimeoutMs + 10000, blob);
+        const response = await httpsFetch(this.control, this.task, 'chunk', this.sent, this.abort.signal, this.conf.ackTimeoutMs + 10000, blob, 2, bytes => { if (!this.abort.signal.aborted) this.uploaded = this.sent + bytes; });
         const result = await response.json() as { offset: number };
         this.check(); if (result.offset !== end) throw new Error('HTTPS 上传确认偏移无效');
         this.sent = this.acked = end; this.progress(this.task.fileId, '正在发送', end, 'https');
@@ -131,6 +133,8 @@ export class SendTask {
     this.progress(this.task.fileId, messageOf(error), this.acked, this.task.mode);
   }
   stop() { this.abort.abort(new Error('旧传输已终止')); this.unsubscribe?.(); if (!this.direct) { if (this.channel) { this.channel.onclose = null; this.channel.onerror = null; this.channel.close(); } this.pc?.close(); } }
+  get active() { return !this.abort.signal.aborted; }
+  get transferredBytes() { return this.task.mode === 'https' ? Math.max(this.acked, this.uploaded) : Math.max(this.acked, this.sent - (this.task.mode === 'ws' ? this.control.socket?.bufferedAmount ?? 0 : this.channel?.bufferedAmount ?? 0)); }
 }
 
 export class ReceiveTask {
@@ -312,7 +316,7 @@ export class ReceiveTask {
             const response = await httpsFetch(this.control, task, 'chunk', offset, signal, 35000, undefined, 0);
             if (response.status === 204) { await delay(1000, signal); continue; }
             if (response.headers.get('X-File-Offset') !== String(offset)) throw new Error('HTTPS 数据块偏移不一致');
-            payload = await readHttpsChunk(response, length, signal);
+            payload = await readHttpsChunk(response, length, signal, bytes => { if (generation === this.generation) this.received = offset + bytes; });
           } catch (error) { if (signal.aborted || error instanceof ApiError || attempt++ >= 2) throw error; await delay(250 * 2 ** attempt, signal); }
         }
         if (generation !== this.generation || this.finished) return;
@@ -367,10 +371,11 @@ export class ReceiveTask {
   async cancel() { if (!this.finished) await this.fail(new Error('已取消')); }
   get done() { return this.finished; }
   get connected() { return this.channel?.readyState === 'open' && !this.finished; }
+  get transferredBytes() { return Math.max(this.sink.offset, this.received); }
 }
 
 export class UploadManager {
-  private running = new Map<string, { abort: AbortController; paused: boolean; hashingIdentity: boolean; attemptId?: string }>();
+  private running = new Map<string, { abort: AbortController; paused: boolean; hashingIdentity: boolean; attemptId?: string; bytes: number }>();
   constructor(private control: ControlSession, private conf: Limits, private source: (id: string) => File | undefined, private progress: Progress) {}
   pause(fileId: string) { const current = this.running.get(fileId); if (current) { current.paused = true; if (current.hashingIdentity) { current.abort.abort(new Error('上传暂停')); this.progress(fileId, '云端上传暂停，等待新的下载需求', 0, 'r2'); } } }
   cancel(fileId: string) { this.running.get(fileId)?.abort.abort(new Error('上传需求已结束')); }
@@ -378,14 +383,14 @@ export class UploadManager {
   async start(fileId: string) {
     if (this.running.has(fileId)) return;
     const file = this.source(fileId); if (!file) return;
-    const entry = { abort: new AbortController(), paused: false, hashingIdentity: false, attemptId: undefined as string | undefined }; this.running.set(fileId, entry);
+    const entry = { abort: new AbortController(), paused: false, hashingIdentity: false, attemptId: undefined as string | undefined, bytes: 0 }; this.running.set(fileId, entry);
     let hashPromise: ReturnType<typeof hashFile> | undefined;
     try {
       const auth = await api<UploadAuthorization>(`${this.control.base}/files/${fileId}/uploads`, this.control.sessionToken, {});
       if (auth.shared || auth.ready) return;
       entry.attemptId = auth.attemptId; entry.abort.signal.throwIfAborted();
       hashPromise = hashFile(file, this.conf.hashChunkBytes, entry.abort.signal); void hashPromise.catch(() => {});
-      if (auth.mode === 'put') await this.put(auth.url!, file, auth.headers!, entry.abort.signal, bytes => this.progress(fileId, '整文件直接上传到 R2', bytes, 'r2'));
+      if (auth.mode === 'put') await this.put(auth.url!, file, auth.headers!, entry.abort.signal, bytes => { entry.bytes = bytes; this.progress(fileId, '整文件直接上传到 R2', bytes, 'r2'); });
       else {
         entry.hashingIdentity = true; this.progress(fileId, '校验源文件，确保分片续传使用原内容', 0, 'r2');
         const hash = await hashPromise; entry.abort.signal.throwIfAborted();
@@ -399,7 +404,8 @@ export class UploadManager {
           if (existing.has(part)) continue;
           const signed = await api<{ url: string; headers: Record<string, string> }>(`${this.control.base}/files/${fileId}/parts/${part}/sign`, this.control.sessionToken, { attemptId: auth.attemptId });
           const blob = file.slice((part - 1) * auth.partSize, Math.min(file.size, part * auth.partSize));
-          await this.put(signed.url, blob, signed.headers, entry.abort.signal, bytes => this.progress(fileId, `直接上传到 R2 · ${part}/${count}`, uploaded + bytes, 'r2'));
+          const wireBase = entry.bytes;
+          await this.put(signed.url, blob, signed.headers, entry.abort.signal, bytes => { entry.bytes = wireBase + bytes; this.progress(fileId, `直接上传到 R2 · ${part}/${count}`, uploaded + bytes, 'r2'); });
           uploaded += blob.size;
         }
         if (entry.paused) { this.progress(fileId, '云端上传暂停，等待新的下载需求', uploaded, 'r2'); return; }
@@ -432,4 +438,5 @@ export class UploadManager {
       xhr.send(file);
     });
   }
+  metric(fileId: string) { const current = this.running.get(fileId); return current && !current.paused && !current.abort.signal.aborted ? { key: `r2-upload:${current.attemptId ?? fileId}`, bytes: current.bytes, mode: 'r2' } : undefined; }
 }
