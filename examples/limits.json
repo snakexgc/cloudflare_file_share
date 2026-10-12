@@ -1,4 +1,6 @@
 {
+  "defaultShareHours": 2,
+  "ownerIdleTimeoutMs": 1800000,
   "maxFileBytes": 10737418240,
   "maxShareBytes": 21474836480,
   "maxFiles": 32,

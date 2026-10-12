@@ -19,6 +19,8 @@ interface Room {
   ownerTokenHash: string;
   sourceHash: string;
   createdAt: number;
+  lastOwnerActiveAt?: number;
+  expiredReason?: 'owner_inactive';
   expiresAt: number;
   status: ShareInfo['status'];
   cleanupStatus: ShareInfo['cleanupStatus'];
@@ -57,6 +59,11 @@ export class ShareRoom extends DurableObject<Env> {
       }
       const entries = await ctx.storage.list<SessionInfo>({ prefix: 'session:' });
       for (const session of entries.values()) this.sessions.set(session.id, session);
+      if (this.room?.lastOwnerActiveAt === undefined && this.room?.status === 'active') {
+        this.captureOwnerActivity(); await ctx.storage.put('room', this.room);
+        const alarm = await ctx.storage.getAlarm(), deadline = this.ownerLastActiveAt() + limits(this.env).ownerIdleTimeoutMs;
+        if (alarm === null || deadline < alarm) await ctx.storage.setAlarm(Math.max(Date.now() + 1000, deadline));
+      }
       ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"type":"ping"}', '{"type":"pong"}'));
     });
   }
@@ -72,15 +79,28 @@ export class ShareRoom extends DurableObject<Env> {
   private owner(fileId?: string) {
     return [...this.sessions.values()].filter(s => s.role === 'owner' && this.online(s) && (!fileId || s.capabilities.readable.includes(fileId))).sort((a, b) => this.seenAt(b) - this.seenAt(a))[0];
   }
+  private ownerLastActiveAt() {
+    let at = this.state().lastOwnerActiveAt ?? this.state().createdAt;
+    for (const session of this.sessions.values()) if (session.role === 'owner') at = Math.max(at, this.seenAt(session));
+    return at;
+  }
+  private ownerInactive() { return Date.now() >= this.ownerLastActiveAt() + limits(this.env).ownerIdleTimeoutMs; }
+  private expiryReason() { return this.state().expiredReason ?? (Date.now() < this.state().expiresAt && this.ownerInactive() ? 'owner_inactive' : undefined); }
+  private captureOwnerActivity() { if (this.room?.status === 'active') this.room.lastOwnerActiveAt = this.ownerLastActiveAt(); }
+  private async expireInactive() {
+    if (this.room?.status === 'active' && Date.now() < this.room.expiresAt && this.ownerInactive()) {
+      this.room.status = 'expired'; this.room.expiredReason = 'owner_inactive'; await this.cleanup(); await this.persist();
+    }
+  }
   private snapshot(): ShareInfo {
     const state = this.state(), owner = this.owner();
-    return { id: state.id, shortCode: state.shortCode, passwordProtected: Boolean(state.passwordHash), createdAt: state.createdAt, expiresAt: state.expiresAt, status: state.status === 'active' && Date.now() >= state.expiresAt ? 'expired' : state.status,
+    return { id: state.id, shortCode: state.shortCode, passwordProtected: Boolean(state.passwordHash), expiredReason: this.expiryReason(), createdAt: state.createdAt, expiresAt: state.expiresAt, status: state.status === 'active' && (Date.now() >= state.expiresAt || this.ownerInactive()) ? 'expired' : state.status,
       cleanupStatus: state.cleanupStatus, ownerStatus: !owner ? 'offline' : owner.capabilities.readable.length ? 'online' : 'file_unavailable',
       activeRequests: state.requests.filter(active).length, files: state.files.filter(x => !x.deleted).map(({ r2Key: _r2Key, modeAdminHash: _modeAdminHash, ...file }) => file) };
   }
   private ensureActive() {
     const state = this.state();
-    if (state.status !== 'active' || Date.now() >= state.expiresAt) throw new HttpError(410, 'share_expired', state.status === 'revoked' ? '分享已撤销' : '分享已过期', { share: this.snapshot() });
+    if (state.status !== 'active' || Date.now() >= state.expiresAt || this.ownerInactive()) throw new HttpError(410, 'share_expired', state.status === 'revoked' ? '分享已撤销' : this.expiryReason() ? '分享者长时间不活跃，分享已销毁' : '分享已过期', { share: this.snapshot() });
   }
   private async ensureAccess(request: Request) {
     const state = this.state(); if (!state.passwordHash) return;
@@ -89,7 +109,7 @@ export class ShareRoom extends DurableObject<Env> {
     if (await validAdmin(this.env, request.headers.get('X-File-Share-Admin') ?? undefined)) return;
     const value = request.headers.get('Cookie')?.split(';').map(item => item.trim()).find(item => item.startsWith(`${accessCookieName(state.id)}=`))?.split('=')[1];
     if (value && /^[a-f0-9]{64}$/.test(value) && state.accessGrants?.some(grant => grant.expiresAt > Date.now() && constantEqual(grant.hash, digest(value)))) return;
-    const expired = state.status !== 'active' || Date.now() >= state.expiresAt;
+    const expired = state.status !== 'active' || Date.now() >= state.expiresAt || this.ownerInactive();
     throw new HttpError(expired ? 410 : 401, expired ? 'share_expired' : 'password_required', expired ? '分享已结束' : '请输入提取密码', { id: state.id, shortCode: state.shortCode, expiresAt: state.expiresAt });
   }
   private session(request: Request, allowExpired = false) {
@@ -105,7 +125,7 @@ export class ShareRoom extends DurableObject<Env> {
   private ownerAuth(request: Request, allowExpired = false) {
     if (!allowExpired) this.ensureActive();
     const hash = digest(bearer(request));
-    if (constantEqual(this.state().ownerTokenHash, hash)) return this.owner();
+    if (constantEqual(this.state().ownerTokenHash, hash)) { if (this.state().status === 'active') this.state().lastOwnerActiveAt = Date.now(); return this.owner(); }
     const session = this.session(request, allowExpired);
     assert(session.role === 'owner', 403, 'owner_forbidden', '此操作需要管理令牌');
     return session;
@@ -143,6 +163,7 @@ export class ShareRoom extends DurableObject<Env> {
     }, Math.max(1000, deadline - Date.now()));
   }
   private async persist() {
+    this.captureOwnerActivity();
     if (this.room) await this.ctx.storage.put('room', this.room);
     const updates: Record<string, SessionInfo> = {};
     for (const key of this.dirty) { const value = this.sessions.get(key); if (value) updates[`session:${key}`] = value; }
@@ -155,7 +176,7 @@ export class ShareRoom extends DurableObject<Env> {
     if (!this.room) return;
     const now = Date.now(), state = this.room, conf = limits(this.env);
     const times: number[] = [];
-    if (state.status === 'active') times.push(state.expiresAt);
+    if (state.status === 'active') times.push(state.expiresAt, Math.max(now + 1000, this.ownerLastActiveAt() + conf.ownerIdleTimeoutMs));
     if (state.nextCleanupAt) times.push(state.nextCleanupAt);
     for (const relay of this.relays.values()) times.push(relay.lastAck + conf.ackTimeoutMs);
     for (const relay of this.httpsRelays.values()) times.push(relay.lastAck + conf.ackTimeoutMs);
@@ -552,6 +573,7 @@ export class ShareRoom extends DurableObject<Env> {
       const epoch = operation === 'ack' ? data.epoch : Number(data.epoch), offset = operation === 'ack' ? data.offset : Number(data.offset);
       assert(typeof epoch === 'number' && Number.isSafeInteger(epoch) && epoch >= 1 && typeof offset === 'number' && Number.isSafeInteger(offset) && offset >= 0 && (operation === 'ack' || /^\d+$/.test(String(data.epoch)) && /^\d+$/.test(String(data.offset))), 400, 'invalid_offset', 'HTTPS epoch 或偏移无效');
       const relay = await this.locked(async () => {
+        await this.expireInactive();
         const session = this.session(request), task = this.requestFor(requestId, session, epoch);
         assert(active(task) && task.mode === 'https' && data.transferId === task.transferId && data.fileId === task.fileId, 409, 'stale_transfer', 'HTTPS 任务身份不一致或已经结束');
         assert((operation === 'chunk' && request.method === 'POST' ? task.ownerId : task.receiverId) === session.id, 403, 'relay_forbidden', '没有此 HTTPS 中继权限');
@@ -570,6 +592,7 @@ export class ShareRoom extends DurableObject<Env> {
     return this.ctx.blockConcurrencyWhile(async () => {
       try {
         const path = new URL(request.url).pathname, method = request.method;
+        if (path.startsWith('/api/shares/')) await this.expireInactive();
         if (path === '/internal/init') {
           assert(!this.room, 409, 'already_initialized', '分享已创建');
           const { password, ...initial } = await readJson<Room & { password?: unknown }>(request);
@@ -617,7 +640,11 @@ export class ShareRoom extends DurableObject<Env> {
           const response = json({ unlocked: true }); response.headers.set('Set-Cookie', accessCookie(request, state.id, secret, state.expiresAt)); return response;
         }
         if (route === '' && method === 'GET' || route === '/sessions' && method === 'POST') await this.ensureAccess(request);
-        if (route === '' && method === 'GET') { this.ensureActive(); return json(this.snapshot()); }
+        if (route === '' && method === 'GET') {
+          this.ensureActive();
+          if (constantEqual(digest(bearer(request)), this.state().ownerTokenHash)) { this.state().lastOwnerActiveAt = Date.now(); await this.persist(); }
+          return json(this.snapshot());
+        }
         if (route === '' && method === 'DELETE') { this.ownerAuth(request, true); if (this.state().status === 'active') this.state().status = 'revoked'; await this.cleanup(); await this.persist(); return json({ share: this.snapshot() }); }
         if (route === '/sessions' && method === 'POST') {
           this.ensureActive(); const data = await readJson(request), role = data.role === 'owner' ? 'owner' : 'receiver';
@@ -640,7 +667,7 @@ export class ShareRoom extends DurableObject<Env> {
           session.capabilities.ws = true; session.lastSeen = Date.now(); this.dirty.add(session.id); await this.persist();
           return new Response(null, { status: 101, webSocket: pair[0], headers: { 'Sec-WebSocket-Protocol': 'file-share' } });
         }
-        if (route === '/files-status' && method === 'GET') { const session = this.session(request); return json({ share: this.snapshot(), cursor: session.seq, requests: this.state().requests.filter(r => r.receiverId === session.id || r.ownerId === session.id).map(r => this.publicTask(r)) }); }
+        if (route === '/files-status' && method === 'GET') { const session = this.session(request); if (session.role === 'owner') await this.persist(); return json({ share: this.snapshot(), cursor: session.seq, requests: this.state().requests.filter(r => r.receiverId === session.id || r.ownerId === session.id).map(r => this.publicTask(r)) }); }
         if (route === '/events' && method === 'GET') {
           const session = this.session(request), now = Date.now(), conf = limits(this.env);
           assert(now - session.lastPoll >= conf.pollMinMs, 429, 'poll_rate', '轮询间隔过短'); session.lastPoll = now;
@@ -819,7 +846,7 @@ export class ShareRoom extends DurableObject<Env> {
       const attachment = socket.deserializeAttachment() as { sessionId?: string } | null;
       const session = attachment?.sessionId ? this.sessions.get(attachment.sessionId) : undefined;
       try {
-        this.ensureActive(); assert(session, 403, 'session_forbidden', '会话无效'); session.lastSeen = Date.now();
+        await this.expireInactive(); this.ensureActive(); assert(session, 403, 'session_forbidden', '会话无效'); session.lastSeen = Date.now();
         if (typeof message !== 'string') { await this.relayData(session, message); return; }
         assert(new TextEncoder().encode(message).byteLength <= limits(this.env).controlMaxBytes, 413, 'control_too_large', '控制消息超限');
         const data = JSON.parse(message) as Record<string, unknown>;
@@ -852,6 +879,7 @@ export class ShareRoom extends DurableObject<Env> {
     await this.ctx.blockConcurrencyWhile(async () => {
       const attachment = socket.deserializeAttachment() as { sessionId?: string } | null;
       const session = attachment?.sessionId ? this.sessions.get(attachment.sessionId) : undefined;
+      if (session?.role === 'owner' && this.room?.status === 'active') this.room.lastOwnerActiveAt = Math.max(this.ownerLastActiveAt(), this.ctx.getWebSocketAutoResponseTimestamp(socket)?.getTime() ?? 0);
       if (!session || this.socket(session.id)) return;
       session.capabilities.ws = false; this.dirty.add(session.id);
       for (const task of this.state().requests.filter(x => x.mode === 'ws' && active(x) && (x.ownerId === session.id || x.receiverId === session.id))) { task.error = 'WS 中继连接中断'; await this.retireTransport(task); this.both('relay-error', task); }
@@ -859,6 +887,7 @@ export class ShareRoom extends DurableObject<Env> {
     });
   }
   private async pruneSessions() {
+    this.captureOwnerActivity();
     const conf = limits(this.env), now = Date.now();
     for (const session of this.sessions.values()) {
       if (now - this.seenAt(session) < conf.leaseMs * 2 || this.state().requests.some(r => active(r) && (r.ownerId === session.id || r.receiverId === session.id))) continue;
@@ -870,7 +899,11 @@ export class ShareRoom extends DurableObject<Env> {
   private async sweep() {
     if (!this.room) return;
     const state = this.room, now = Date.now(), conf = limits(this.env);
-    if (state.status !== 'active' || now >= state.expiresAt) { if (state.status === 'active') state.status = 'expired'; await this.cleanup(); return; }
+    this.captureOwnerActivity();
+    if (state.status !== 'active' || now >= state.expiresAt || this.ownerInactive()) {
+      if (state.status === 'active') { state.status = 'expired'; if (now < state.expiresAt) state.expiredReason = 'owner_inactive'; }
+      await this.cleanup(); return;
+    }
     for (const task of state.requests.filter(active)) {
       const receiver = this.sessions.get(task.receiverId), owner = task.ownerId ? this.sessions.get(task.ownerId) : undefined;
       if (!receiver || !this.online(receiver)) { await this.cancelTask(task, '接收者已离线'); continue; }

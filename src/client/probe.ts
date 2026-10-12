@@ -60,10 +60,17 @@ async function wsProbe() {
   return '握手和小消息回显成功';
 }
 export function mountProbes(conf: ProbeConfig, retestDirect: () => void) {
+  const expanded = document.querySelector('#network-panel')?.hasAttribute('open');
   document.querySelector('#network-panel')?.remove();
-  const container = document.createElement('section'); container.id = 'network-panel'; container.className = 'card network-panel';
-  container.innerHTML = `<div class="network-heading"><strong>传输方式检测</strong><span>自动检测 · 真实直连需两端在线</span><button id="retest" class="button secondary" type="button">快速复测</button></div><dl id="probe-results"></dl><details class="rtc-diagnostics"><summary>查看 WebRTC 环境诊断</summary><p id="rtc-diagnostics"></p></details><p id="punch-status">等待另一端在线，随后自动进行直连打洞</p>`;
-  const main = document.querySelector('main')!; main.insertBefore(container, main.querySelector('.workspace, .share-workspace'));
+  const container = document.createElement('details'); container.id = 'network-panel'; container.className = 'card network-panel';
+  if (expanded) container.setAttribute('open', '');
+  container.innerHTML = `<summary><strong>传输方式检测</strong><span>点击展开查看</span></summary><div class="network-body"><div class="network-heading"><span>自动检测 · 真实直连需两端在线</span><button id="retest" class="button secondary" type="button">快速复测</button></div><dl id="probe-results"></dl><details class="rtc-diagnostics"><summary>查看 WebRTC 环境诊断</summary><p id="rtc-diagnostics"></p></details><p id="punch-status">等待另一端在线，随后自动进行直连打洞</p></div>`;
+  const card = document.querySelector('.upload-card, .share-card'); if (!card) return;
+  let column = card.parentElement!;
+  if (!column.classList.contains('file-column')) {
+    const wrapper = document.createElement('div'); wrapper.className = 'file-column'; column.insertBefore(wrapper, card); wrapper.appendChild(card); column = wrapper;
+  }
+  column.appendChild(container);
   let busy = false;
   const run = async (manual = false) => {
     if (busy) return; busy = true; const button = container.querySelector<HTMLButtonElement>('#retest')!; button.disabled = true;

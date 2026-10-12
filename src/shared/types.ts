@@ -16,6 +16,7 @@ export interface ShareInfo {
   id: string;
   shortCode?: string;
   passwordProtected?: boolean;
+  expiredReason?: 'owner_inactive';
   createdAt: number;
   expiresAt: number;
   status: 'active' | 'expired' | 'revoked';

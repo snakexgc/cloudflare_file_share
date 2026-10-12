@@ -18,6 +18,7 @@ const securityHeaders = {
 };
 async function createShare(request: Request, env: Env, source: string) {
   const conf = limits(env), data = await readJson(request, conf.controlMaxBytes);
+  if (data.expiresInHours === undefined) data.expiresInHours = conf.defaultShareHours;
   assert(data.shortCode === undefined || validShortCode(data.shortCode), 400, 'invalid_short_code', '短链接须为 3–32 位小写字母、数字、下划线或连字符，且不能使用文件分享 ID');
   assert(data.password === undefined || typeof data.password === 'string' && data.password.length >= 4 && data.password.length <= 64 && !/[\x00-\x1f\x7f]/.test(data.password), 400, 'invalid_share_password', '提取密码须为 4–64 个字符，不接受控制字符');
   assert(validHours(data.expiresInHours), 400, 'invalid_expiry', '有效期必须是 1–24 小时的整数');
@@ -133,7 +134,7 @@ export default {
       await env.DB.batch([env.DB.prepare('DELETE FROM admin_sessions WHERE expires_at <= ?').bind(Date.now()), env.DB.prepare('DELETE FROM presence WHERE last_seen <= ?').bind(Date.now() - 3600000)]);
       let cursor = '';
       while (true) {
-        const rows = await env.DB.prepare("SELECT DISTINCT s.id FROM shares s LEFT JOIN cleanup_tasks c ON c.share_id = s.id WHERE s.id > ? AND ((s.expires_at <= ? AND s.cleanup_status != 'cleaned') OR s.status = 'revoked' OR c.next_retry_at <= ? OR (s.cleaned_at IS NOT NULL AND s.cleaned_at + ? <= ?)) ORDER BY s.id LIMIT 100").bind(cursor, Date.now(), Date.now(), limits(env).tombstoneMs, Date.now()).all<{ id: string }>();
+        const rows = await env.DB.prepare("SELECT DISTINCT s.id FROM shares s LEFT JOIN cleanup_tasks c ON c.share_id = s.id WHERE s.id > ? AND (((s.expires_at <= ? OR s.status = 'expired') AND s.cleanup_status != 'cleaned') OR s.status = 'revoked' OR c.next_retry_at <= ? OR (s.cleaned_at IS NOT NULL AND s.cleaned_at + ? <= ?)) ORDER BY s.id LIMIT 100").bind(cursor, Date.now(), Date.now(), limits(env).tombstoneMs, Date.now()).all<{ id: string }>();
         if (!rows.results.length) break;
         for (let i = 0; i < rows.results.length; i += 5) {
           await budget(env, '/do-used', { count: rows.results.slice(i, i + 5).length });
