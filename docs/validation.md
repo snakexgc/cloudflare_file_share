@@ -130,4 +130,14 @@ Edge 浏览器通过本地 Wrangler 与验收页面调用生产客户端代码�
 
 管理统计计入实际 GET 转发字节（包含重读），取消与结算保持幂等；HTTPS 请求按普通 HTTP / DO 请求计量。累计任务活跃时长把并行任务相加，因此不是 Cloudflare 账单的房间时长。DO 重启可能丢失尚未持久化的在途字节统计，账本仍为应用侧估算。
 
-此轮仅本地验证，**没有部署本次 HTTPS 功能到 Cloudflare**。未实传 10 GiB 文件、未验证云端 100 MB 请求体限制、128 MB 内存 / CPU / DO 实际时长、跨网络慢链路或浏览器原生保存对话框；HTTPS → P2P 的覆盖为自动测试，不能视为真实跨 NAT 热切换验收。
+上述为部署前本地验证，线上结果见下节。未实传 10 GiB 文件、未触达云端 100 MB 请求体限制，也未测量 128 MB 内存 / CPU / DO 实际时长、跨网络慢链路或浏览器原生保存对话框；HTTPS → P2P 的覆盖为自动测试，不能视为真实跨 NAT 热切换验收。
+
+## 2026-10-12 HTTPS 中继上传与部署
+
+源码提交 `cfd4823c4b68444f962212cb696760389b6886f5` 已推送至 GitHub `main`。通过 `npm run deploy` 完成 TypeScript 检查、前端构建、静态资源上传和 Worker 发布，版本为 `d58aa29b-b484-4083-b68b-5621d369547c`，继续使用既有 D1 / R2 / SQLite DO binding 与每 5 分钟 Cron。
+
+[正式域名](https://share.snakexgc.com) 与 [workers.dev 入口](https://cloudflare-file-share.9420.workers.dev) 均验证首页、最新 JavaScript 静态资源和 CSP 响应正常。`/api/config` 确认 HTTPS 已启用、块大小 `16777216`、完整文件上限 `10737418240`，匿名 R2 仍关闭；HTTPS 探测回显成功，匿名管理 overview 返回 403，原有 WSS 小消息回显复测成功。
+
+通过正式域名使用 Node.js Fetch 与真实云端 API / DO 验证：创建仅声明 `https=true`、`ws=false`、`webrtc=false` 的 owner / receiver 会话，自动授权 `https` 任务。实传 **33,554,449 字节**，实际块大小为 `[16777216, 16777216, 17]`。每个上传 POST 均在目标文件写入并 POST ACK 后才返回新的偏移；整份文件写入同一个本地目标，关闭后重新读取，SHA-256 为 `d8cd1e9d5fc0cceff21d96962ec12cd3330987580be884c2ba0e6b94abf5a3ad`，与源内容完全一致。服务端任务确认为 completed，整个文件传输没有建立 WebSocket。
+
+该文件传输只使用程序生成的测试内容，分享 `c602861d84524874a4f8d39f0cbde22c` 已撤销，随后读取返回 410，清理状态为 cleaned。没有上传用户文件，也没有创建 R2 文件对象。此次是 Node.js 的真实云端传输验收；浏览器 OPFS 与 HTTPS / WS 并行的证据仍为上一节本地验收，不混作线上浏览器或云端并行测试。
