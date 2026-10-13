@@ -189,3 +189,11 @@ Edge 浏览器确认默认输入为 2、短链接焦点无内层 outline 且由�
 当前 Edge 的 WebRTC API 可用。真实本地 Workers / DO 与浏览器同机双会话分别通过 **WS 信令 + LAN 数据** 和 **HTTPS 信令 + LAN 数据**；两次均传输 **2,097,169 字节**，传输期间 getStats 确认选中 `host → host` 候选对，ICE 服务器列表为空。保存 OPFS 文件后重新读取，字节数与 SHA-256 均与源一致：`be619fa5586a0ae58e37b01ea9e88010523fe8100de9f1c996ccadf88957805b`。验收代码先读取活动连接统计，再等待关闭，避免从已关闭 PC 的空统计误报失败。
 
 以上是本地同机验证，未部署新版本，未完成两台设备间的真实 Wi-Fi / 路由器隔离 / 跨子网验收。内网模式仍需联网打开页面与交换信令。原生文件选择器的自动化 setFiles 被当前 Edge 扩展的文件 URL 权限阻止；未改变扩展或浏览器安全设置，原生文件选择及系统保存对话框未作为本轮通过项。
+
+## 2026-10-14 GitHub 与 Cloudflare 发布
+
+功能提交 `45def52823e470afa16598ab9f39c915c1fb21d9` 已推送至 GitHub `main`。发布前完整回归 **203 项测试通过，14 个测试文件**；TypeScript、Vite 构建、Wrangler dry-run 通过。无新 D1 迁移。Cloudflare Worker 发布版本为 `18f02fff-b29c-4c5e-a68d-dc16e348ff74`。
+
+正式域名 `https://share.snakexgc.com` 与 workers.dev 入口 `https://cloudflare-file-share.9420.workers.dev` 均返回最新页面，引用 `index-Dm2GW3uP.js` 和 `index-a0NdBGWF.css`；两个入口下载的 JS / CSS 内容 SHA-256 均与本地生产构建一致，页面保留禁止嵌入策略。公开配置确认默认 2 小时、源端不活跃时限 30 分钟。
+
+两个入口分别使用独立的匿名测试分享验证线上 API：创建与读取保持 `transferMode: "lan"`，下载任务为 `lan / connecting`、无 ICE 服务器、无公网预热 peer；接受本地 mDNS host 候选，拒绝 relay 候选；报告连接失败后任务保持 LAN 并结束，无中继回退。测试分享均已撤销，随后读取返回 410。本次线上验证为 API 策略与静态资源验证，不包含实际文件数据传输；浏览器同机实传证据见上节，跨设备 Wi-Fi 验收仍未进行。
