@@ -177,3 +177,15 @@ Edge 浏览器确认默认输入为 2、短链接焦点无内层 outline 且由�
 提交 `610e412` 已上传至 GitHub `main`，Worker 发布版本为 `ee8af2d6-a4f7-4ebc-ac99-e8bb0acc7fb4`。正式域名与 workers.dev 的 `/api/config` 均确认 `defaultShareHours:2`、`ownerIdleTimeoutMs:1800000`，静态资源为 `index-BlBSDQbB.js`。线上浏览器确认输入为 2、检测区收起且位于文件卡片下方、短链接内层 outline 为 none 并由外框提供焦点提示；完整截图保存为 `docs/screenshots/share-layout-live-2026-10-12.png`（Git 忽略）。
 
 线上创建 API 省略有效期，确认原期限为 2 小时；带密码短链接的权限隔离、冲突和解锁复测通过。纯 HTTP 控制 / HTTPS 数据传输 **65,553 字节**，保存后重新读取 SHA-256 为 `ca32f06a037dd7b4fe417817d1d76fff8f18120fcdd0c6d4977a2d091f16e866`，与源一致，服务端 completed，全程无 WS。测试分享 `8ac6963e18954546b3ec1eb0675ce36b` 已撤销、cleaned，随后读取 410；本地开发服务已停止，未操作用户分享或云端对象。
+
+## 2026-10-13 页面排版与内网直传（本地）
+
+参考 [文件快传](https://transfer.52python.cn/?type=webrtc&mode=send) 的系统字体、36px 标题、16px 正文、14px 按钮以及居中卡片布局，重整首页、发送页、接收页和管理台样式。首页提供自动传输与内网直传，短链接和提取密码默认折叠；连接检测仍在文件卡片下方收起。390px 与 1280px 的真实页面视口检查未发现横向溢出，手机模式纵向排列传输选项。截图保存于 Git 忽略的 `docs/screenshots/home-mobile.jpg` 与 `home-desktop.jpg`。
+
+新增 `lan` 传输模式及分享策略 `transferMode: "lan"`。客户端使用空 ICE 服务器列表，双方和服务端共同过滤内嵌 SDP 与 trickle ICE，仅允许私网 / 本地 IPv6 / mDNS host 候选。房间策略持久化，不创建公网 P2P 预热通道；LAN 失败结束任务，不签发 TURN、不启用 WS / HTTPS / R2 回退。自动分享可由匿名接收者选择内网、从内网切回自动并保留已写入偏移，其他强制方式仍检查管理员授权。无新增 D1 迁移或 limits 字段。
+
+完整回归 **203 项测试通过，14 个测试文件**，包括 LAN 候选边界、DO 重启后策略保持、匿名权限、无 WebRTC、失败停止、内嵌和 trickle 候选过滤、双方 RTC 配置与描述 / ICE 顺序。客户端单元用例替代了 RTC 网络；真实浏览器验收另行执行。TypeScript、Vite 生产构建和 Wrangler deploy dry-run 均通过。
+
+当前 Edge 的 WebRTC API 可用。真实本地 Workers / DO 与浏览器同机双会话分别通过 **WS 信令 + LAN 数据** 和 **HTTPS 信令 + LAN 数据**；两次均传输 **2,097,169 字节**，传输期间 getStats 确认选中 `host → host` 候选对，ICE 服务器列表为空。保存 OPFS 文件后重新读取，字节数与 SHA-256 均与源一致：`be619fa5586a0ae58e37b01ea9e88010523fe8100de9f1c996ccadf88957805b`。验收代码先读取活动连接统计，再等待关闭，避免从已关闭 PC 的空统计误报失败。
+
+以上是本地同机验证，未部署新版本，未完成两台设备间的真实 Wi-Fi / 路由器隔离 / 跨子网验收。内网模式仍需联网打开页面与交换信令。原生文件选择器的自动化 setFiles 被当前 Edge 扩展的文件 URL 权限阻止；未改变扩展或浏览器安全设置，原生文件选择及系统保存对话框未作为本轮通过项。

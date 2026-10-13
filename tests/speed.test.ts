@@ -8,4 +8,4 @@ it('恢复偏移不算新流量，切换任务和网络重试时重置样本', (
   const meter = new TransferSpeed(); meter.sample('a', 8192, 0); expect(meter.sample('a', 9216, 1000)).toBe(1024);
   expect(meter.sample('b', 9216, 2000)).toBe(0); expect(meter.sample('b', 10240, 3000)).toBe(1024); expect(meter.sample('b', 9216, 4000)).toBe(0);
 });
-it('每种传输方式均有明确显示名称', () => { expect(Object.keys(MODE_LABELS)).toEqual(['p2p', 'turn', 'ws', 'https', 'r2']); });
+it('每种传输方式均有明确显示名称', () => { expect(Object.keys(MODE_LABELS)).toEqual(['lan', 'p2p', 'turn', 'ws', 'https', 'r2']); });

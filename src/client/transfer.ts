@@ -7,6 +7,8 @@ import { ControlSession } from './control';
 import { hashFile, VerifiedSink } from './sink';
 import type { DirectTransport } from './peer';
 import { httpsFetch, readHttpsChunk } from './https';
+import { rtcConfiguration } from './rtc';
+import { isLanCandidate, lanDescription } from '../shared/lan';
 
 export type Progress = (fileId: string, label: string, bytes: number, mode?: string, finished?: boolean) => void;
 const terminal = (task: DownloadRequest) => ['canceled', 'failed', 'completed'].includes(task.status);
@@ -26,6 +28,7 @@ export class SendTask {
   private running = false;
   private lastAck = Date.now();
   private uploaded = 0;
+  private sentEnd = false;
   constructor(public task: DownloadRequest, private file: File, private control: ControlSession, private conf: Limits, private stun: IceServer[], private progress: Progress, private direct?: DirectTransport) { this.acked = this.sent = task.offset; }
   async start() {
     try {
@@ -33,25 +36,35 @@ export class SendTask {
       try { await this.file.slice(0, Math.min(1, this.file.size)).arrayBuffer(); } catch { throw new SourceReadError('本地文件不可读，请重新选择原文件'); }
       if (this.task.mode === 'https') { this.control.track(this.task); void this.runHttps(); return; }
       if (this.task.mode === 'ws') { void this.run(); return; }
-      if (this.task.peerId && this.direct) {
+      if (this.task.mode === 'p2p' && this.task.peerId && this.direct) {
         this.pc = this.direct.pc; this.channel = this.direct.channel;
         this.unsubscribe = this.direct.subscribe(this.task.transferId, data => { if (typeof data === 'string') { try { this.credit(JSON.parse(data)); } catch (error) { void this.fail(error); } } }, () => { void this.fail(new Error('后台直连中断')); });
         // 允许接收者先发 ACK；订阅后发送 ready 请求，接收端重发写入偏移。
         this.channel.send(JSON.stringify({ kind: 'ready', transferId: this.task.transferId, epoch: this.task.epoch })); void this.run(); return;
       }
-      const pc = this.pc = new RTCPeerConnection({ iceServers: this.task.mode === 'turn' ? this.task.iceServers : this.stun, iceTransportPolicy: this.task.mode === 'turn' ? 'relay' : 'all' });
-      pc.onicecandidate = event => { if (event.candidate && !this.abort.signal.aborted) void this.control.signal(this.task, 'rtc-ice', { candidate: event.candidate.toJSON() }).catch(error => this.fail(error)); };
+      const pc = this.pc = new RTCPeerConnection(rtcConfiguration(this.task, this.stun));
+      const localIce: RTCIceCandidateInit[] = []; let offered = false;
+      pc.onicecandidate = event => {
+        if (!event.candidate || this.abort.signal.aborted) return;
+        const candidate = event.candidate.toJSON();
+        if (this.task.mode === 'lan' && !isLanCandidate(candidate.candidate ?? '')) return;
+        if (!offered) localIce.push(candidate);
+        else void this.control.signal(this.task, 'rtc-ice', { candidate }).catch(error => this.fail(error));
+      };
       pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed' && !this.abort.signal.aborted) void this.fail(new Error('WebRTC 数据连接失败')); };
       const channel = this.channel = pc.createDataChannel('file', { ordered: true }); channel.binaryType = 'arraybuffer';
       channel.onopen = () => { void this.run(); };
       channel.onclose = () => { if (!this.abort.signal.aborted && !this.running) void this.fail(new Error('数据通道提前关闭')); };
-      channel.onerror = () => { void this.fail(new Error('DataChannel 发送失败')); };
+      channel.onerror = () => { if (!this.sentEnd) void this.fail(new Error('DataChannel 发送失败')); };
       channel.onmessage = event => {
         if (typeof event.data !== 'string') { void this.fail(new Error('发送端收到非法数据帧')); return; }
         try { this.credit(JSON.parse(event.data) as Record<string, unknown>); } catch (error) { void this.fail(error); }
       };
       await pc.setLocalDescription(await pc.createOffer());
-      await this.control.signal(this.task, 'rtc-offer', { description: pc.localDescription!.toJSON() });
+      const description = pc.localDescription!.toJSON();
+      await this.control.signal(this.task, 'rtc-offer', { description: this.task.mode === 'lan' ? lanDescription(description) : description });
+      offered = true;
+      for (const candidate of localIce) await this.control.signal(this.task, 'rtc-ice', { candidate });
     } catch (error) { await this.fail(error); }
   }
   credit(data: Record<string, unknown>) {
@@ -64,9 +77,10 @@ export class SendTask {
     if (this.abort.signal.aborted) return;
     if (event.type === 'rtc-answer') {
       const data = event.data as { description: RTCSessionDescriptionInit };
-      await this.pc!.setRemoteDescription(data.description); for (const candidate of this.ice.splice(0)) await this.pc!.addIceCandidate(candidate);
+      await this.pc!.setRemoteDescription(this.task.mode === 'lan' ? lanDescription(data.description) : data.description); for (const candidate of this.ice.splice(0)) await this.pc!.addIceCandidate(candidate);
     } else if (event.type === 'rtc-ice') {
       const candidate = (event.data as { candidate: RTCIceCandidateInit }).candidate;
+      if (this.task.mode === 'lan' && !isLanCandidate(candidate.candidate ?? '')) return;
       if (this.pc?.remoteDescription) await this.pc.addIceCandidate(candidate); else this.ice.push(candidate);
     }
   }
@@ -97,7 +111,7 @@ export class SendTask {
       const sha256 = bytesToHex(hash.digest());
       await this.control.signal(this.task, 'file-end', { sha256, size: this.file.size });
       this.check();
-      if (this.task.mode !== 'ws') this.channel!.send(JSON.stringify({ kind: 'end', transferId: this.task.transferId, epoch: this.task.epoch, sha256, size: this.file.size }));
+      if (this.task.mode !== 'ws') { this.sentEnd = true; this.channel!.send(JSON.stringify({ kind: 'end', transferId: this.task.transferId, epoch: this.task.epoch, sha256, size: this.file.size })); }
       this.progress(this.task.fileId, '等待接收端校验', this.file.size, this.task.mode);
     } catch (error) { await this.fail(error); }
   }
@@ -174,7 +188,7 @@ export class ReceiveTask {
     if (task.status === 'requested') {
       this.progress(task.fileId, task.mode === 'r2' ? '等待分享者上传云端' : '分享者离线或源文件不可读，等待恢复', this.sink.offset, task.mode); return;
     }
-    this.progress(task.fileId, task.mode === 'p2p' ? '正在连接直传' : task.mode === 'turn' ? '正在连接 TURN' : task.mode === 'ws' ? '正在连接 WS 中继' : task.mode === 'https' ? '正在连接 HTTPS 中继' : '准备云端下载', this.sink.offset, task.mode);
+    this.progress(task.fileId, task.mode === 'lan' ? '正在连接内网直传' : task.mode === 'p2p' ? '正在连接直传' : task.mode === 'turn' ? '正在连接 TURN' : task.mode === 'ws' ? '正在连接 WS 中继' : task.mode === 'https' ? '正在连接 HTTPS 中继' : '准备云端下载', this.sink.offset, task.mode);
     if (task.mode === 'ws') { this.control.relayAck(task, this.sink.offset); this.armTimeout(); }
     else if (task.mode === 'r2') { if (task.status === 'transferring') this.r2Work = this.downloadR2(); }
     else if (task.mode === 'https') {
@@ -183,7 +197,7 @@ export class ReceiveTask {
       this.armTimeout();
       if (task.sourceHash && this.sink.offset === this.sink.file.size) await this.finish(task.sourceHash);
     }
-    else if (task.peerId) {
+    else if (task.mode === 'p2p' && task.peerId) {
       const direct = this.directFor?.(task.peerId);
       if (!direct) { void this.advance(new Error('预热直连已失效')); return; }
       this.pc = direct.pc; this.channel = direct.channel;
@@ -210,17 +224,29 @@ export class ReceiveTask {
     if (event.type === 'rtc-offer') {
       if (this.pc) return;
       this.task = task;
-      const pc = this.pc = new RTCPeerConnection({ iceServers: task.mode === 'turn' ? task.iceServers : this.stun, iceTransportPolicy: task.mode === 'turn' ? 'relay' : 'all' });
-      pc.onicecandidate = candidate => { if (candidate.candidate && !this.finished) void this.control.signal(this.task, 'rtc-ice', { candidate: candidate.candidate.toJSON() }).catch(error => this.advance(error)); };
+      const pc = this.pc = new RTCPeerConnection(rtcConfiguration(task, this.stun));
+      const localIce: RTCIceCandidateInit[] = []; let answered = false;
+      pc.onicecandidate = event => {
+        if (!event.candidate || this.finished || this.abort.signal.aborted) return;
+        const candidate = event.candidate.toJSON();
+        if (task.mode === 'lan' && !isLanCandidate(candidate.candidate ?? '')) return;
+        if (!answered) localIce.push(candidate);
+        else void this.control.signal(task, 'rtc-ice', { candidate }).catch(error => this.advance(error));
+      };
       pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed' && !this.finished) void this.advance(new Error('WebRTC 连接失败')); };
       pc.ondatachannel = event => this.attach(event.channel);
-      await pc.setRemoteDescription((event.data as { description: RTCSessionDescriptionInit }).description);
+      const remote = (event.data as { description: RTCSessionDescriptionInit }).description;
+      await pc.setRemoteDescription(task.mode === 'lan' ? lanDescription(remote) : remote);
       for (const candidate of this.ice.splice(0)) await pc.addIceCandidate(candidate);
       await pc.setLocalDescription(await pc.createAnswer());
-      await this.control.signal(task, 'rtc-answer', { description: pc.localDescription!.toJSON() });
+      const description = pc.localDescription!.toJSON();
+      await this.control.signal(task, 'rtc-answer', { description: task.mode === 'lan' ? lanDescription(description) : description });
+      answered = true;
+      for (const candidate of localIce) await this.control.signal(task, 'rtc-ice', { candidate });
       this.armTimeout(this.conf.connectTimeoutMs);
     } else if (event.type === 'rtc-ice') {
       const candidate = (event.data as { candidate: RTCIceCandidateInit }).candidate;
+      if (task.mode === 'lan' && !isLanCandidate(candidate.candidate ?? '')) return;
       if (this.pc?.remoteDescription) await this.pc.addIceCandidate(candidate); else this.ice.push(candidate);
     }
   }
@@ -345,14 +371,14 @@ export class ReceiveTask {
     }
     this.stopTransport(); await this.serial;
     try {
-      this.progress(this.task.fileId, `正在切换传输方式：${messageOf(error)}`, this.sink.offset, this.task.mode);
+      this.progress(this.task.fileId, `${this.task.mode === 'lan' ? '内网连接失败，正在结束传输' : '正在切换传输方式'}：${messageOf(error)}`, this.sink.offset, this.task.mode);
       const task = await api<DownloadRequest>(`${this.control.base}/download-requests/${this.task.id}/advance`, this.control.sessionToken, { epoch: this.task.epoch, offset: this.sink.offset, reason: messageOf(error) });
       this.advancing = false; await this.start(task);
       for (const event of this.deferred.splice(0)) if (event.type !== 'attempt') await this.event(event);
     } catch (failure) { this.advancing = false; await this.fail(failure); }
   }
   async upgrade(peerId: string) {
-    if (this.finished || this.advancing || this.finalizing || this.task.mode === 'p2p' || this.task.forcedMode || !this.directFor?.(peerId)) return;
+    if (this.finished || this.advancing || this.finalizing || this.task.mode === 'lan' || this.task.mode === 'p2p' || this.task.forcedMode || !this.directFor?.(peerId)) return;
     await this.migrate('upgrade', { peerId });
   }
   async switchTo(mode: string) { if (!this.finished && !this.advancing && !this.finalizing) await this.migrate('switch', { mode }); }

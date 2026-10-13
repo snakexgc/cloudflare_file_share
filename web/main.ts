@@ -1,10 +1,11 @@
 import './style.css';
+import { homeContent } from './home';
 import QRCode from 'qrcode';
 import { api, ApiError } from '../src/client/api';
 import { ControlSession } from '../src/client/control';
 import { chooseSink, hashFile } from '../src/client/sink';
 import { ReceiveTask, SendTask, UploadManager, type Progress } from '../src/client/transfer';
-import type { ControlEvent, DownloadRequest, FileInfo, IceServer, ShareInfo } from '../src/shared/types';
+import type { ControlEvent, DownloadRequest, FileInfo, IceServer, ShareInfo, ShareTransferMode } from '../src/shared/types';
 import type { Limits } from '../src/worker/config';
 import { validHours, decodeFrame } from '../src/shared/protocol';
 import { bytesToHex } from '@noble/hashes/utils.js';
@@ -26,11 +27,13 @@ const icons = {
   check: '<path d="m5 12 4 4L19 6"/>',
   copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V4H4v12h4"/>',
   download: '<path d="M12 3v13m-5-5 5 5 5-5M4 16v5h16v-5"/>',
+  network: '<rect x="8" y="3" width="8" height="5" rx="1"/><path d="M12 8v5M5 17v-4h14v4"/><rect x="2" y="17" width="6" height="4" rx="1"/><rect x="16" y="17" width="6" height="4" rx="1"/>',
 };
 function icon(name: keyof typeof icons, className = '') { return `<svg class="icon ${className}" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">${icons[name]}</svg>`; }
 const app = document.querySelector<HTMLDivElement>('#app')!;
 let config: PublicConfig;
 let selected: File[] = [];
+let transferMode: ShareTransferMode = 'auto';
 let share: ShareInfo | undefined;
 let ownerToken: string | undefined;
 let control: ControlSession | undefined;
@@ -54,17 +57,19 @@ const $ = <T extends HTMLElement = HTMLElement>(selector: string) => document.qu
 function escape(value: string) { return value.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!); }
 function size(bytes: number) { if (!bytes) return '0 B'; const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']; const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), 4); return `${(bytes / 1024 ** i).toLocaleString('zh-CN', { maximumFractionDigits: i ? 1 : 0 })} ${units[i]}`; }
 function shell(content: string) {
-  app.innerHTML = `<header class="header"><a href="/" class="brand"><span class="brand-mark">${icon('arrows')}</span><span>临时传</span></a><span class="header-note">轻一点分享，少一点等待</span><a class="header-link" href="/admin">${config?.admin ? '管理台 · 已登录' : '管理登录'}</a><a href="#how">如何分享 ${icon('link')}</a></header><main>${content}</main><footer><span>文件来去自如，分享有始有终。</span><span>${icon('shield')} 直连优先 · 按时失效 · 原文件交付</span></footer><div id="toast" role="status" aria-live="polite"></div>`;
+  app.innerHTML = `<header class="header"><a href="/" class="brand"><span class="brand-mark">${icon('arrows')}</span><span>临时传</span></a><span class="header-note">轻一点分享，少一点等待</span><nav class="header-nav" aria-label="页面导航"><a href="/#how">如何分享</a><a class="header-link" href="/admin">${config?.admin ? '管理台 · 已登录' : '管理登录'}</a></nav></header><main>${content}</main><footer><span>文件来去自如，分享有始有终。</span><span>${icon('shield')} 原文件交付 · 完整性校验 · 按时失效</span></footer><div id="toast" role="status" aria-live="polite"></div>`;
 }
 function inactivityNote() { return `分享者连续 ${((config?.limits.ownerIdleTimeoutMs ?? 1800000) / 60000).toLocaleString('zh-CN', { maximumFractionDigits: 2 })} 分钟不活跃时，分享和云端文件会提前销毁。`; }
-function network() { mountProbes({ ...config, httpOnly: control?.httpOnly || share?.files.some(file => file.forcedMode === 'https') }, () => { peers?.retest(); }); }
+function network() { if (config) mountProbes({ ...config, lanOnly: (share?.transferMode ?? transferMode) === 'lan', httpOnly: control?.httpOnly || share?.files.some(file => file.forcedMode === 'https') }, () => { peers?.retest(); }); }
 function modes() {
-  if (!config.admin || !share) return;
+  if (!share || ownerToken && !config.admin) return;
+  const lanOnly = share.transferMode === 'lan';
   for (const file of share.files) {
     const parent = document.querySelector(`#file-${file.id}`)!;
     if (parent.querySelector('.mode-choice')) continue;
     const row = document.createElement('div'); row.className = 'mode-choice';
-    row.innerHTML = `<label for="mode-${file.id}">此文件的传输方式</label><select id="mode-${file.id}" aria-label="${escape(file.name)} 的传输方式">${[['auto', '自动选择'], ['p2p', '强制 P2P 直连'], ['turn', '强制 TURN 中继'], ['ws', '强制 WS 中继'], ['https', '强制 HTTPS 中继'], ['r2', '强制 R2 云端']].map(([value, name]) => `<option value="${value}" ${value === (file.forcedMode ?? 'auto') ? 'selected' : ''}>${name}</option>`).join('')}</select><small>指定方式失败后报告错误；传输中从已写入偏移切换</small>`;
+    const choices = lanOnly ? [['lan', '内网直传']] : config.admin ? [['auto', '自动选择'], ['lan', '内网直传'], ['p2p', '强制 P2P 直连'], ['turn', '强制 TURN 中继'], ['ws', '强制 WS 中继'], ['https', '强制 HTTPS 中继'], ['r2', '强制 R2 云端']] : [['auto', '自动选择'], ['lan', '内网直传']];
+    row.innerHTML = `<label for="mode-${file.id}">传输方式</label><select id="mode-${file.id}" aria-label="${escape(file.name)} 的传输方式" ${lanOnly ? 'disabled' : ''}>${choices.map(([value, name]) => `<option value="${value}" ${value === (lanOnly ? 'lan' : file.forcedMode ?? 'auto') ? 'selected' : ''}>${name}</option>`).join('')}</select><small>${lanOnly ? '仅连接同一局域网的设备，不使用公网中继' : '内网直传适合同一 Wi-Fi；自动选择适合跨网络分享'}</small>`;
     parent.insertBefore(row, parent.querySelector('.transfer-info'));
     if (ownerToken) (row.querySelector('select') as unknown as HTMLSelectElement).onchange = event => { void (async () => { try { const mode = (event.target as HTMLSelectElement).value; await startControl(mode === 'https'); if (mode === 'https') control!.preferHttp([...senders.values()].some(sender => sender.task.mode === 'ws')); if (mode !== 'https') await control!.ensureWs().catch(() => {}); await api(`${control!.base}/files/${file.id}/mode`, control!.sessionToken, { mode }); if (mode === 'https') network(); toast('已设置此文件传输方式，在线下载者会切换'); } catch (failure) { error(String(failure)); } })(); };
     else (row.querySelector('select') as unknown as HTMLSelectElement).onchange = event => { const receiver = [...receivers.values()].find(x => x.task.fileId === file.id && !x.done); if (receiver) void receiver.switchTo((event.target as HTMLSelectElement).value); };
@@ -74,11 +79,18 @@ function toast(message: string) { const element = $('#toast'); element.textConte
 function error(message: string) { const element = $('#error'); element.textContent = message; element.hidden = !message; }
 function fileTile(file: { name: string; size: number }, extra = '') { const ext = file.name.includes('.') ? file.name.split('.').pop()!.slice(0, 5).toUpperCase() : 'FILE'; return `<span class="file-symbol">${escape(ext || 'FILE')}</span><span class="file-description"><strong title="${escape(file.name)}">${escape(file.name)}</strong><small>${size(file.size)}</small></span>${extra}`; }
 function renderHome() {
-  shell(`<section class="hero"><div class="eyebrow"><span class="live-dot"></span> 让文件，直接抵达</div><h1>文件轻轻一传，<br/><span>分享就这么简单。</span></h1><p>无需注册，保留原文件。选择文件，生成链接，<br class="desktop-break"/>让下一次分享少一点麻烦。</p></section><div class="workspace"><section class="card upload-card"><div class="card-heading"><div><h2>创建一次临时分享</h2><p>从你的设备，传到对方的设备。</p></div><span class="step-label">01 / 开始分享</span></div><label class="dropzone" id="dropzone" for="file-input"><span class="upload-orbit">${icon('upload')}</span><strong>把文件拖到这里</strong><span>或点击选择文件 · 支持多文件</span><small id="file-limit">正在读取服务配置…</small><input id="file-input" type="file" multiple aria-label="选择分享文件"/></label><div id="selected-files" class="selected-files"></div><form id="create-form"><div class="expiry-field"><label for="hours">链接有效期<small>从创建分享时开始计时</small></label><div class="number-input"><input id="hours" name="expiresInHours" type="number" min="1" max="24" step="1" value="${config?.limits.defaultShareHours ?? 2}" required inputmode="numeric"/><span>小时</span></div></div><div class="expiry-note">${icon('clock')} 默认 ${config?.limits.defaultShareHours ?? 2} 小时，最长 24 小时。${inactivityNote()}</div><div class="share-options"><label for="short-code">自定义短链接 <span>可选</span></label><div class="short-link-input"><span>/s/</span><input id="short-code" type="text" minlength="3" maxlength="32" pattern="[a-z0-9][a-z0-9_-]{2,31}" placeholder="例如 summer-files" autocomplete="off"/></div><small>3–32 位小写字母、数字、下划线或连字符，创建后不可修改。</small><label for="share-password">提取密码 <span>可选</span></label><input id="share-password" type="password" minlength="4" maxlength="64" autocomplete="new-password" placeholder="4–64 个字符"/><small>设置后接收者需要先验证密码，创建后不可修改。</small></div><div id="challenge"></div><p id="error" class="error-message" role="alert" hidden></p><button id="create" class="button primary wide" type="submit" disabled>生成分享链接 ${icon('arrows')}</button></form><div class="waiting-note">${icon('shield')} 有人点击下载后才开始传输，请保持分享页面打开。</div></section><aside id="how" class="how-panel"><span class="eyebrow">少一点中转，多一点直接</span><h2>一条链接，<br/>让文件找到对方。</h2><ol class="instructions"><li><span>1</span><div><strong>选择你想分享的文件</strong><p>原内容、原名称，每个文件完整交付。</p></div></li><li><span>2</span><div><strong>把链接发给对方</strong><p>复制链接或扫描二维码，无需注册。</p></div></li><li><span>3</span><div><strong>保持页面打开，等待接收</strong><p>下载开始后优先直连，必要时自动中继。</p></div></li></ol><div class="route-note"><div class="route-icons"><span>${icon('file')}</span><i></i><span class="route-middle">${icon('arrows')}</span><i></i><span>${icon('download')}</span></div><strong>能直传，就直接传</strong><p>直连不可用时依次尝试 TURN、WS 和 HTTPS 中继，所有路径都受服务额度限制。</p></div></aside></div>`);
+  shell(homeContent(config?.limits.defaultShareHours ?? 2, inactivityNote(), icon, transferMode));
+  document.querySelectorAll<HTMLInputElement>('input[name=transfer-mode]').forEach(input => { input.onchange = () => {
+    transferMode = input.value as ShareTransferMode;
+    $('#mode-help').textContent = transferMode === 'lan' ? '两端需在同一局域网。文件直接传输，不使用公网中继；打开页面和建立连接仍需联网。' : '优先连接双方设备；直连不可用时，自动尝试中继。';
+    $('#how-transfer').textContent = transferMode === 'lan' ? '连接同一 Wi-Fi，双方保持页面打开。' : '双方保持在线，点击下载即开始。';
+    network();
+  }; });
   $('#file-input').onchange = () => { addFiles(Array.from($<HTMLInputElement>('#file-input').files ?? [])); $<HTMLInputElement>('#file-input').value = ''; };
   const zone = $('#dropzone'); zone.ondragover = event => { event.preventDefault(); zone.classList.add('dragging'); }; zone.ondragleave = () => zone.classList.remove('dragging');
   zone.ondrop = event => { event.preventDefault(); zone.classList.remove('dragging'); addFiles(Array.from(event.dataTransfer?.files ?? [])); };
   $('#create-form').onsubmit = event => { event.preventDefault(); void create(); };
+  $('#create-form').addEventListener('invalid', event => { if ((event.target as Element).closest('.advanced-options')) document.querySelector<HTMLDetailsElement>('.advanced-options')!.open = true; }, true);
 }
 function addFiles(files: File[]) {
   if (!config) return;
@@ -103,7 +115,7 @@ async function create() {
   error(''); const button = $<HTMLButtonElement>('#create'); button.disabled = true; button.textContent = '正在创建分享…';
   try {
     const shortCode = $<HTMLInputElement>('#short-code').value, password = $<HTMLInputElement>('#share-password').value;
-    const result = await api<{ id: string; shortCode?: string; passwordProtected: boolean; ownerToken: string; createdAt: number; expiresAt: number; files: FileInfo[]; url: string }>('/api/shares', undefined, { expiresInHours: hours, files: selected.map(file => ({ name: file.name, size: file.size, mime: file.type, lastModified: file.lastModified })), turnstileToken: challengeToken, ...(shortCode ? { shortCode } : {}), ...(password ? { password } : {}) });
+    const result = await api<{ id: string; transferMode: ShareTransferMode; shortCode?: string; passwordProtected: boolean; ownerToken: string; createdAt: number; expiresAt: number; files: FileInfo[]; url: string }>('/api/shares', undefined, { expiresInHours: hours, transferMode, files: selected.map(file => ({ name: file.name, size: file.size, mime: file.type, lastModified: file.lastModified })), turnstileToken: challengeToken, ...(shortCode ? { shortCode } : {}), ...(password ? { password } : {}) });
     createdPassword = password;
     ownerToken = result.ownerToken; result.files.forEach((file, index) => sources.set(file.id, selected[index]));
     selected = [];
@@ -131,6 +143,11 @@ function renderShare() {
     document.querySelectorAll<HTMLButtonElement>('.cancel').forEach(button => { button.onclick = () => { const task = [...receivers.values()].find(x => x.task.fileId === button.dataset.file && !x.done); if (task) void task.cancel(); }; });
   }
   $('#reconnect').onclick = () => { void (control ? control.recover() : startControl()).catch(failure => error(String(failure))); };
+  if (share.transferMode === 'lan') {
+    const note = document.createElement('div'); note.className = 'share-transfer-note';
+    note.innerHTML = `${icon('network')}<div><strong>内网直传</strong><p>两端请连接同一 Wi-Fi / 局域网。文件不经过公网中继；建立连接仍需联网。</p></div>`;
+    $('.share-card').insertBefore(note, $('.share-card .card-heading').nextSibling);
+  }
   clearInterval(expiryTimer); expiryTimer = setInterval(tick, 1000); tick(); updateShare(share);
   clearInterval(refreshTimer); refreshTimer = setInterval(() => { if (!ended) void refresh(); }, 12000);
   modes(); network();
@@ -204,8 +221,10 @@ async function startControl(httpOnly = share?.files.every(file => file.forcedMod
   if (!share || control || ended) return;
   control = new ControlSession(share.id, ownerToken ? 'owner' : 'receiver', { webrtc: rtcSupport().available, ws: !httpOnly && typeof WebSocket === 'function', https: true, readable: [...sources.keys()] }, config.limits, ownerToken);
   if (httpOnly) control.preferHttp();
-  peers = new PeerManager(control, config.stunServers, punchStatus);
-  peers.onReady = peer => { for (const receiver of receivers.values()) if (!receiver.done && receiver.task.ownerId === peer.ownerId) void receiver.upgrade(peer.id); };
+  if (share.transferMode !== 'lan') {
+    peers = new PeerManager(control, config.stunServers, punchStatus);
+    peers.onReady = peer => { for (const receiver of receivers.values()) if (!receiver.done && receiver.task.ownerId === peer.ownerId) void receiver.upgrade(peer.id); };
+  }
   control.busy = () => [...receivers.values()].some(x => !x.done) || Boolean(share?.activeRequests);
   control.onShare = updateShare;
   control.onState = (state, message) => { if (!ended) { $('#connection').textContent = state === 'offline' ? '暂时离线' : '连接正常'; $('#connection').title = state === 'ws' ? 'WS 信令连接' : state === 'http' ? 'HTTPS 信令与在线租约' : message ?? ''; $('#reconnect').hidden = state !== 'offline'; } };
@@ -231,7 +250,7 @@ async function startControl(httpOnly = share?.files.every(file => file.forcedMod
     } else if (data.type === 'error') error(String(data.message));
   };
   uploads = new UploadManager(control, config.limits, fileId => sources.get(fileId), progress);
-  try { await control.start(); peers.start(); } catch (failure) { peers.stop(); control.stop(); control = undefined; $('#reconnect').hidden = false; error(failure instanceof Error ? failure.message : '无法建立控制会话'); }
+  try { await control.start(); peers?.start(); } catch (failure) { peers?.stop(); control.stop(); control = undefined; $('#reconnect').hidden = false; error(failure instanceof Error ? failure.message : '无法建立控制会话'); }
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && !ended) { void refresh(); void control?.recover().catch(() => {}); } });
 }
 function terminal(task: DownloadRequest) { return ['completed', 'canceled', 'failed'].includes(task.status); }
@@ -256,7 +275,7 @@ async function handleEvent(event: ControlEvent) {
       const credit = pendingCredits.get(task.transferId); if (credit) { sender.credit(credit); pendingCredits.delete(task.transferId); }
       void sender.start();
     } else if (event.type === 'rtc-answer' || event.type === 'rtc-ice') { if (old && old.task.epoch === task.epoch) await old.event(event); }
-    else if (['stop-attempt', 'completed', 'canceled', 'failed', 'waiting-source', 'relay-error'].includes(event.type)) { old?.stop(); senders.delete(task.id); if (event.type === 'completed') progress(task.fileId, '对方已完成保存与校验', share!.files.find(file => file.id === task.fileId)!.size, task.mode, true); }
+    else if (['stop-attempt', 'completed', 'canceled', 'failed', 'waiting-source', 'relay-error'].includes(event.type)) { old?.stop(); senders.delete(task.id); if (event.type === 'completed') progress(task.fileId, '对方已完成保存与校验', share!.files.find(file => file.id === task.fileId)!.size, task.mode, true); else if (event.type === 'failed') progress(task.fileId, `未完成：${task.error ?? '传输失败'}`, task.offset, task.mode); }
   } else if (task) {
     const receiver = receivers.get(task.id);
     if (receiver) await receiver.event(event);
@@ -275,7 +294,7 @@ async function download(fileId: string) {
     await startControl(chosen === 'https' || file.forcedMode === 'https'); if (!control) throw new Error('控制连接尚未就绪，请重新连接');
     if (chosen === 'https' || file.forcedMode === 'https') { control.preferHttp([...receivers.values()].some(receiver => !receiver.done && receiver.task.mode === 'ws' && receiver.task.fileId !== fileId)); network(); }
     else await control.ensureWs().catch(() => {});
-    const request = await api<DownloadRequest>(`${control.base}/download-requests`, control.sessionToken, { fileId, ...(config.admin && chosen ? { mode: chosen } : {}) });
+    const request = await api<DownloadRequest>(`${control.base}/download-requests`, control.sessionToken, { fileId, ...(chosen ? { mode: chosen } : {}) });
     const receiver = new ReceiveTask(request, sink, control, config.limits, config.stunServers, progress, id => peers?.get(id)); receivers.set(request.id, receiver);
     await receiver.start();
     const waiting = pendingEvents.filter(event => event.request?.id === request.id);
@@ -313,7 +332,7 @@ async function main() {
   const presence = () => { void api('/api/presence', undefined, { id: presenceId, page: location.pathname }).catch(() => {}); };
   presence(); const presenceTimer = setInterval(presence, 30000); window.addEventListener('pagehide', () => clearInterval(presenceTimer), { once: true });
   if (location.pathname === '/admin' || location.pathname === '/admin/') { await adminMain(); return; }
-  window.addEventListener('focus', () => { void (async () => { if (!config) return; try { const next = await api<PublicConfig>('/api/config'); if (next.admin !== config.admin) { config = next; const link = document.querySelector<HTMLAnchorElement>('.header-link'); if (link) link.textContent = config.admin ? '管理台 · 已登录' : '管理登录'; if (config.admin) modes(); else document.querySelectorAll('.mode-choice').forEach(x => x.remove()); network(); } } catch { /* 原有传输继续运行，后端仍验证授权。 */ } })(); });
+  window.addEventListener('focus', () => { void (async () => { if (!config) return; try { const next = await api<PublicConfig>('/api/config'); if (next.admin !== config.admin) { config = next; const link = document.querySelector<HTMLAnchorElement>('.header-link'); if (link) link.textContent = config.admin ? '管理台 · 已登录' : '管理登录'; document.querySelectorAll('.mode-choice').forEach(x => x.remove()); modes(); network(); } } catch { /* 原有传输继续运行，后端仍验证授权。 */ } })(); });
   const match = location.pathname.match(/^\/s\/([a-z0-9_-]{3,32})$/);
   if (!match) renderHome(); else shell('<section class="hero"><div class="eyebrow">临时传</div><h1>正在读取分享…</h1><p id="error" class="error-message" role="alert" hidden></p></section>');
   try {

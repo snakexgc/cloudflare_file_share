@@ -21,24 +21,26 @@ async function run(mode: string) {
   let shareId = '', ownerToken = '', savedName = '', directory: Directory | undefined;
   let deadline: ReturnType<typeof setTimeout> | undefined, sink: VerifiedSink | undefined;
   const useHttps = mode.startsWith('https'), mixed = mode === 'https-mixed';
+  const useLan = mode.startsWith('lan'), useRtc = useLan || mode.startsWith('rtc');
   const nativeWs = globalThis.WebSocket, nativeRtc = globalThis.RTCPeerConnection;
   const senders = new Map<string, SendTask>();
   let discovery: ReturnType<typeof setInterval> | undefined, extraControl: ControlSession | undefined, extraTask: ReceiveTask | undefined, extraName = '';
   let overlap = false;
   let speedTimer: ReturnType<typeof setInterval> | undefined, peakSpeed = 0;
+  let lanVerification: Promise<void> | undefined;
   try {
     if (useHttps && !mixed) { globalThis.WebSocket = undefined as unknown as typeof WebSocket; globalThis.RTCPeerConnection = undefined as unknown as typeof RTCPeerConnection; log('已禁用 WebSocket 和 RTCPeerConnection 构造器'); }
     const support = rtcSupport(); log(`当前页面 RTCPeerConnection 类型：${support.constructorType}；可创建数据连接：${support.available}`);
-    if (mode.startsWith('rtc') && !support.available) { log(`SKIP：${support.message}；本次无法验收直连。`); return; }
+    if (useRtc && !support.available) { log(`SKIP：${support.message}；本次无法验收${useLan ? '内网' : ''}直连。`); return; }
     const config = await api<{ limits: Limits; stunServers: IceServer[] }>('/api/config');
     if (mode === 'ws-large' && config.limits.chunkBytes !== WS_DEFAULT_PAYLOAD_BYTES) throw new Error('大消息验收需要默认 WS 分片配置');
     const source = new Uint8Array(mode === 'zero' || mode === 'https-zero' ? 0 : useHttps ? 2 * config.limits.httpsChunkBytes + 17 : mode === 'ws-large' ? 2 * WS_DEFAULT_PAYLOAD_BYTES + 17 : 2 * 1024 ** 2 + 17);
     for (let i = 0; i < source.length; i++) source[i] = (i * 79 + 53) % 256;
     const file = new File([source], mode === 'zero' ? '空文件.bin' : '浏览器验收.bin', { type: 'application/octet-stream', lastModified: 123 });
-    const created = await api<{ id: string; ownerToken: string; files: FileInfo[] }>('/api/shares', undefined, { expiresInHours: 1, files: [{ name: file.name, size: file.size, mime: file.type, lastModified: file.lastModified }] });
+    const created = await api<{ id: string; ownerToken: string; files: FileInfo[] }>('/api/shares', undefined, { expiresInHours: 1, transferMode: useLan ? 'lan' : 'auto', files: [{ name: file.name, size: file.size, mime: file.type, lastModified: file.lastModified }] });
     shareId = created.id; ownerToken = created.ownerToken;
     log(`分享已创建：${created.id}；源文件 ${source.length} 字节`);
-    const useRtc = mode.startsWith('rtc'), useWs = !useHttps && mode !== 'rtc-http';
+    const useWs = !useHttps && mode !== 'rtc-http' && mode !== 'lan-http';
     owner = new ControlSession(shareId, 'owner', { webrtc: useRtc, ws: useWs || mixed, https: useHttps, readable: [created.files[0].id] }, config.limits, ownerToken);
     receiver = new ControlSession(shareId, 'receiver', { webrtc: useRtc, ws: useWs, https: useHttps, readable: [] }, config.limits);
     if (useHttps && !mixed) { owner.preferHttp(); receiver.preferHttp(); }
@@ -84,7 +86,15 @@ async function run(mode: string) {
     directory = await (navigator.storage as unknown as { getDirectory(): Promise<Directory> }).getDirectory();
     savedName = `qa-${created.id}.bin`; const handle = await directory.getFileHandle(savedName, { create: true });
     const nativeWriter = await handle.createWritable();
-    const measuredWriter: FileWriter = mode === 'https-speed' ? { write: async bytes => { await delay(2000); await nativeWriter.write(bytes); }, truncate: size => nativeWriter.truncate(size), seek: position => nativeWriter.seek(position), close: () => nativeWriter.close(), abort: () => nativeWriter.abort() } : nativeWriter;
+    const verifyLan = async () => {
+      const pc = (senderTask as unknown as { pc: RTCPeerConnection }).pc;
+      if (pc.getConfiguration().iceServers?.length) throw new Error('内网模式配置了外部 ICE 服务器');
+      const stats = await pc.getStats(); let hostPair = false;
+      stats.forEach(item => { if (item.type === 'candidate-pair' && item.state === 'succeeded' && item.nominated) { const local = stats.get(item.localCandidateId), remote = stats.get(item.remoteCandidateId); log(`内网候选对：${local?.candidateType} → ${remote?.candidateType}`); hostPair = local?.candidateType === 'host' && remote?.candidateType === 'host'; } });
+      if (!hostPair) throw new Error('未验证双方使用 host 候选，不能认定为内网直传');
+      log('内网连接：ICE 服务器为空，双方选中 host 候选；本次为同机双会话测试');
+    };
+    const measuredWriter: FileWriter = mode === 'https-speed' || useLan ? { write: async bytes => { if (useLan) await (lanVerification ??= verifyLan()); else await delay(2000); await nativeWriter.write(bytes); }, truncate: size => nativeWriter.truncate(size), seek: position => nativeWriter.seek(position), close: () => nativeWriter.close(), abort: () => nativeWriter.abort() } : nativeWriter;
     sink = new VerifiedSink(created.files[0], measuredWriter);
     const task = await api<DownloadRequest>(`${receiver.base}/download-requests`, receiver.sessionToken, { fileId: created.files[0].id });
     log(`实际传输模式：${task.mode}`);
@@ -122,7 +132,8 @@ async function run(mode: string) {
       log(`HTTPS 与 WS 活跃任务同时存在：${overlap}`);
     }
     await Promise.race([Promise.all([finished, settled, ...extraFinished]), timedOut]); clearTimeout(deadline);
-    if (mode.startsWith('rtc') && receiveTask.task.mode !== 'p2p') throw new Error(`原定 WebRTC 传输回退到了 ${receiveTask.task.mode}；不能视为直连通过`);
+    if (useRtc && receiveTask.task.mode !== (useLan ? 'lan' : 'p2p')) throw new Error(`原定 WebRTC 传输变成了 ${receiveTask.task.mode}；不能视为直连通过`);
+    if (useLan) { if (!lanVerification) throw new Error('内网数据未写入'); await lanVerification; }
     if (useHttps && receiveTask.task.mode !== 'https') throw new Error(`HTTPS 测试使用了 ${receiveTask.task.mode}`);
     if (mode === 'https-speed') { if (peakSpeed <= 0) throw new Error('真实传输未取得非零速度样本'); log(`传输速度样本峰值：${(peakSpeed / 1024 ** 2).toFixed(2)} MiB/s（本地网络，非公网性能测量）`); }
     const actual = new Uint8Array(await (await handle.getFile()).arrayBuffer()), expectedHash = bytesToHex(sha256(source)), actualHash = bytesToHex(sha256(actual));

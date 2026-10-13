@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>临时传 · 响应式页面验收</title>
+  <style>
+    body { margin: 0; padding: 24px; background: #e9edf5; color: #20293b; font: 14px/1.6 system-ui; }
+    header { display: flex; gap: 16px; align-items: center; margin-bottom: 20px; }
+    select, input, button { font: inherit; padding: 8px; border: 1px solid #cbd4e3; border-radius: 6px; }
+    input { width: 260px; }
+    iframe { display: block; width: 390px; height: 1200px; background: #fff; border: 1px solid #cad3e2; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <label>视口宽度 <select id="width"><option value="390">390px 手机</option><option value="768">768px 平板</option><option value="1280">1280px 桌面</option></select></label>
+    <label>页面路径 <input id="path" value="/" /></label>
+    <button id="open" type="button">打开页面</button>
+    <span>嵌入真实本地页面，检查排版、交互与横向溢出。</span>
+  </header>
+  <iframe title="响应式页面预览" src="http://127.0.0.1:5173/"></iframe>
+  <script type="module" src="./layout.ts"></script>
+</body>
+</html>

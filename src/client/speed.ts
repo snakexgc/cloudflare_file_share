@@ -1,4 +1,4 @@
-export const MODE_LABELS: Record<string, string> = { p2p: 'P2P 直连', turn: 'TURN 中继', ws: 'WS 中继', https: 'HTTPS 中继', r2: 'R2 云端' };
+export const MODE_LABELS: Record<string, string> = { lan: '内网直传', p2p: 'P2P 直连', turn: 'TURN 中继', ws: 'WS 中继', https: 'HTTPS 中继', r2: 'R2 云端' };
 /** Three-second window, reset on retries/epochs, with idle samples decaying to zero. */
 export class TransferSpeed {
   private key = '';

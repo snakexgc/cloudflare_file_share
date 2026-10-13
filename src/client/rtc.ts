@@ -1,3 +1,9 @@
+import type { DownloadRequest, IceServer } from '../shared/types';
+
+export function rtcConfiguration(task: DownloadRequest, stun: IceServer[]): RTCConfiguration {
+  return { iceServers: task.mode === 'lan' ? [] : task.mode === 'turn' ? task.iceServers : stun, iceTransportPolicy: task.mode === 'turn' ? 'relay' : 'all' };
+}
+
 export interface RtcSupport {
   available: boolean;
   constructorType: string;

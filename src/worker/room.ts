@@ -9,10 +9,12 @@ import { generateTurn, revokeTurn } from './turn';
 import { meteredDB } from './db';
 import { closeHttpsRoom, HttpsRelay } from './https-relay';
 import { accessCookie, accessCookieName, createSharePassword, verifySharePassword, type SharePassword } from './share-access';
+import { isLanCandidate, lanDescription } from '../shared/lan';
 
 interface StoredFile extends FileInfo { r2Key?: string; modeAdminHash?: string }
 interface Room {
   id: string;
+  transferMode?: ShareInfo['transferMode'];
   shortCode?: string;
   passwordHash?: SharePassword;
   accessGrants?: { hash: string; expiresAt: number }[];
@@ -94,7 +96,7 @@ export class ShareRoom extends DurableObject<Env> {
   }
   private snapshot(): ShareInfo {
     const state = this.state(), owner = this.owner();
-    return { id: state.id, shortCode: state.shortCode, passwordProtected: Boolean(state.passwordHash), expiredReason: this.expiryReason(), createdAt: state.createdAt, expiresAt: state.expiresAt, status: state.status === 'active' && (Date.now() >= state.expiresAt || this.ownerInactive()) ? 'expired' : state.status,
+    return { id: state.id, transferMode: state.transferMode ?? 'auto', shortCode: state.shortCode, passwordProtected: Boolean(state.passwordHash), expiredReason: this.expiryReason(), createdAt: state.createdAt, expiresAt: state.expiresAt, status: state.status === 'active' && (Date.now() >= state.expiresAt || this.ownerInactive()) ? 'expired' : state.status,
       cleanupStatus: state.cleanupStatus, ownerStatus: !owner ? 'offline' : owner.capabilities.readable.length ? 'online' : 'file_unavailable',
       activeRequests: state.requests.filter(active).length, files: state.files.filter(x => !x.deleted).map(({ r2Key: _r2Key, modeAdminHash: _modeAdminHash, ...file }) => file) };
   }
@@ -300,7 +302,8 @@ export class ShareRoom extends DurableObject<Env> {
     return false;
   }
   private setMode(file: StoredFile, mode: unknown, hash: string) {
-    assert(['auto', 'p2p', 'turn', 'ws', 'https', 'r2'].includes(String(mode)), 400, 'invalid_mode', '传输方式无效');
+    assert(['auto', 'lan', 'p2p', 'turn', 'ws', 'https', 'r2'].includes(String(mode)), 400, 'invalid_mode', '传输方式无效');
+    assert(this.state().transferMode !== 'lan' || mode === 'auto' || mode === 'lan', 409, 'lan_only', '此分享仅允许内网直传');
     file.forcedMode = mode === 'auto' ? undefined : mode as Mode; file.modeAdminHash = hash;
     for (const task of this.state().requests.filter(x => x.fileId === file.id && active(x))) this.emit(task.receiverId, 'mode-change', task, { mode });
   }
@@ -314,11 +317,19 @@ export class ShareRoom extends DurableObject<Env> {
   }
   private async activate(task: DownloadRequest) {
     const file = this.file(task.fileId), owner = this.owner(file.id), receiver = this.sessions.get(task.receiverId);
+    if (this.state().transferMode === 'lan') task.forcedMode = 'lan';
     if (file.forcedMode && await validAdmin(this.env, file.modeAdminHash)) { task.forcedMode ??= file.forcedMode; task.adminGrant ??= file.modeAdminHash; }
+    if (task.forcedMode === 'lan') task.mode = 'lan';
     if (task.forcedMode === 'r2') { task.ownerId = owner?.id; await this.startR2(task); return; }
     if (!task.forcedMode && !owner && file.uploadStatus === 'ready' && await this.r2Allowed(task)) { await this.startR2(task); return; }
     if (!owner || !receiver) { task.status = 'requested'; this.emit(task.receiverId, 'waiting-source', task); return; }
     task.ownerId = owner.id;
+    if (task.forcedMode === 'lan') {
+      task.mode = 'lan'; delete task.peerId; delete task.iceServers;
+      task.status = owner.capabilities.webrtc && receiver.capabilities.webrtc ? 'connecting' : 'failed';
+      if (task.status === 'failed') task.error = '内网直传需要两端浏览器提供 WebRTC，请检查浏览器设置或改用自动传输分享';
+      this.both(task.status === 'failed' ? 'failed' : 'attempt', task); return;
+    }
     if (task.forcedMode === 'https') { await this.startHttps(task); return; }
     if (task.forcedMode === 'ws') { await this.chooseRelayOrR2(task); return; }
     if (task.forcedMode === 'turn') { await this.startTurn(task); return; }
@@ -336,7 +347,11 @@ export class ShareRoom extends DurableObject<Env> {
     task.epoch++; task.offset = offset; task.transferId = id(); task.error = reason.slice(0, 200);
     delete task.peerId;
     this.both('stop-attempt', task, { previous });
-    if (task.forcedMode) { task.status = 'failed'; this.both('failed', task); await this.noDemand(file.id); return; }
+    if (task.forcedMode || previous === 'lan') {
+      task.status = 'failed';
+      if (previous === 'lan') task.error = `内网直传失败：${reason.slice(0, 120)}。请确认两端处于同一局域网且未开启客户端隔离；此模式不会使用公网中继。`;
+      this.both('failed', task); await this.noDemand(file.id); return;
+    }
     if (!this.owner(file.id) && file.uploadStatus !== 'ready') { task.status = 'requested'; this.emit(task.receiverId, 'waiting-source', task); return; }
     if (previous === 'r2') { task.status = 'failed'; this.both('failed', task); await this.noDemand(file.id); return; }
     if (previous === 'p2p' && await this.startTurn(task)) return;
@@ -510,9 +525,19 @@ export class ShareRoom extends DurableObject<Env> {
     const payload = data.payload as Record<string, unknown> | undefined, kind = String(data.kind);
     const isOwner = session.id === task.ownerId;
     if (['rtc-offer', 'rtc-answer', 'rtc-ice'].includes(kind)) {
-      assert(task.mode === 'p2p' || task.mode === 'turn', 409, 'wrong_transport', '当前模式不是 WebRTC');
+      assert(task.mode === 'lan' || task.mode === 'p2p' || task.mode === 'turn', 409, 'wrong_transport', '当前模式不是 WebRTC');
       assert(kind === 'rtc-ice' || (kind === 'rtc-offer' ? isOwner : !isOwner), 403, 'signal_forbidden', '信令角色不符');
       assert(payload && JSON.stringify(payload).length <= (kind === 'rtc-ice' ? 2048 : 24576), 413, 'signal_too_large', 'WebRTC 信令超限');
+      if (task.mode === 'lan') {
+        if (kind === 'rtc-ice') {
+          const candidate = (payload.candidate as { candidate?: unknown } | undefined)?.candidate;
+          assert(typeof candidate === 'string' && isLanCandidate(candidate), 400, 'invalid_lan_candidate', '内网直传只允许私网或 mDNS host 候选');
+        } else {
+          const description = payload.description as RTCSessionDescriptionInit | undefined;
+          assert(description && typeof description.sdp === 'string' && description.type === (kind === 'rtc-offer' ? 'offer' : 'answer'), 400, 'invalid_lan_description', '内网直传信令无效');
+          payload.description = lanDescription(description);
+        }
+      }
       this.emit(isOwner ? task.receiverId : task.ownerId, kind, task, payload);
     } else if (kind === 'file-end') {
       assert(isOwner && typeof payload?.sha256 === 'string' && SHA256_PATTERN.test(payload.sha256) && payload.size === this.file(task.fileId).size, 403, 'end_forbidden', '源文件完成消息无效');
@@ -683,6 +708,7 @@ export class ShareRoom extends DurableObject<Env> {
         if (route === '/signals' && method === 'POST') { const session = this.session(request); await this.signal(session, await readJson(request, limits(this.env).controlMaxBytes)); await this.persist(); return json({ ok: true }); }
         if (route === '/peers' && method === 'POST') {
           const session = this.session(request); assert(session.capabilities.webrtc, 409, 'rtc_unavailable', '浏览器不支持 WebRTC');
+          if (this.state().transferMode === 'lan') return json({ peers: [] });
           const peers = this.state().peers ??= [];
           const live = new Set([...this.sessions.values()].filter(s => this.online(s) && s.capabilities.webrtc).map(s => s.id));
           this.state().peers = peers.filter(p => live.has(p.ownerId) && live.has(p.receiverId));
@@ -728,7 +754,9 @@ export class ShareRoom extends DurableObject<Env> {
           assert(this.state().requests.filter(active).length < limits(this.env).maxRequests, 429, 'download_limit', '下载并发已达上限');
           this.state().requests = this.state().requests.filter(active).concat(this.state().requests.filter(x => !active(x)).slice(-32));
           const task: DownloadRequest = { id: id(), fileId: String(data.fileId), receiverId: session.id, epoch: 1, mode: 'p2p', status: 'requested', offset: 0, transferId: id(), createdAt: Date.now() };
-          if (data.mode && data.mode !== 'auto') { assert(await validAdmin(this.env, request.headers.get('X-File-Share-Admin') ?? undefined), 403, 'admin_required', '指定传输方式需要管理员登录'); assert(['p2p', 'turn', 'ws', 'https', 'r2'].includes(String(data.mode)), 400, 'invalid_mode', '传输方式无效'); task.forcedMode = data.mode as Mode; task.adminGrant = session.adminHash; }
+          assert(this.state().transferMode !== 'lan' || data.mode === undefined || data.mode === 'auto' || data.mode === 'lan', 409, 'lan_only', '此分享仅允许内网直传');
+          if (data.mode === 'lan') task.forcedMode = 'lan';
+          else if (data.mode && data.mode !== 'auto') { assert(await validAdmin(this.env, request.headers.get('X-File-Share-Admin') ?? undefined), 403, 'admin_required', '指定传输方式需要管理员登录'); assert(['p2p', 'turn', 'ws', 'https', 'r2'].includes(String(data.mode)), 400, 'invalid_mode', '传输方式无效'); task.forcedMode = data.mode as Mode; task.adminGrant = session.adminHash; }
           this.state().requests.push(task); await this.activate(task); await this.persist(); return json(this.publicTask(task), 201);
         }
         const downloadRoute = route.match(/^\/download-requests\/([a-f0-9]{32})(?:\/(advance|upgrade|switch|resume))?$/);
@@ -740,9 +768,11 @@ export class ShareRoom extends DurableObject<Env> {
             const data = await readJson(request); this.requestFor(task.id, session, data.epoch);
             if (downloadRoute[2] === 'switch') {
               const file = this.file(task.fileId), directAdmin = request.headers.get('X-File-Share-Admin');
-              assert(active(task) && ['auto', 'p2p', 'turn', 'ws', 'https', 'r2'].includes(String(data.mode)), 409, 'invalid_switch', '任务状态或传输方式无效');
+              assert(active(task) && ['auto', 'lan', 'p2p', 'turn', 'ws', 'https', 'r2'].includes(String(data.mode)), 409, 'invalid_switch', '任务状态或传输方式无效');
+              assert(this.state().transferMode !== 'lan' || data.mode === 'auto' || data.mode === 'lan', 409, 'lan_only', '此分享仅允许内网直传');
               const fileAuthorized = data.mode === (file.forcedMode ?? 'auto') && await validAdmin(this.env, file.modeAdminHash);
-              assert(fileAuthorized || await validAdmin(this.env, directAdmin ?? undefined), 403, 'admin_required', '切换指定方式需要管理员授权');
+              const lanChoice = data.mode === 'lan' || data.mode === 'auto' && task.forcedMode === 'lan';
+              assert(lanChoice || fileAuthorized || await validAdmin(this.env, directAdmin ?? undefined), 403, 'admin_required', '切换指定方式需要管理员授权');
               assert(typeof data.offset === 'number' && Number.isSafeInteger(data.offset) && data.offset >= task.offset && data.offset <= file.size, 400, 'invalid_offset', '恢复偏移无效');
               await this.retireTransport(task); this.both('stop-attempt', task);
               task.epoch++; task.offset = data.offset; task.transferId = id(); task.mode = 'p2p'; task.forcedMode = data.mode === 'auto' ? undefined : data.mode as Mode;

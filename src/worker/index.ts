@@ -19,6 +19,8 @@ const securityHeaders = {
 async function createShare(request: Request, env: Env, source: string) {
   const conf = limits(env), data = await readJson(request, conf.controlMaxBytes);
   if (data.expiresInHours === undefined) data.expiresInHours = conf.defaultShareHours;
+  assert(data.transferMode === undefined || data.transferMode === 'auto' || data.transferMode === 'lan', 400, 'invalid_mode', '分享传输方式须为自动选择或内网直传');
+  const transferMode = data.transferMode ?? 'auto';
   assert(data.shortCode === undefined || validShortCode(data.shortCode), 400, 'invalid_short_code', '短链接须为 3–32 位小写字母、数字、下划线或连字符，且不能使用文件分享 ID');
   assert(data.password === undefined || typeof data.password === 'string' && data.password.length >= 4 && data.password.length <= 64 && !/[\x00-\x1f\x7f]/.test(data.password), 400, 'invalid_share_password', '提取密码须为 4–64 个字符，不接受控制字符');
   assert(validHours(data.expiresInHours), 400, 'invalid_expiry', '有效期必须是 1–24 小时的整数');
@@ -50,10 +52,10 @@ async function createShare(request: Request, env: Env, source: string) {
     ]);
     await budget(env, '/do-used', { count: 1 });
     const response = await env.ROOMS.get(env.ROOMS.idFromName(shareId)).fetch(new Request('https://room/internal/init', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: shareId, shortCode: data.shortCode, password: data.password, ownerTokenHash: digest(ownerToken), sourceHash: source, createdAt, expiresAt, status: 'active', cleanupStatus: 'pending', files, requests: [], uploads: [], pendingRevocations: [] }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: shareId, transferMode, shortCode: data.shortCode, password: data.password, ownerTokenHash: digest(ownerToken), sourceHash: source, createdAt, expiresAt, status: 'active', cleanupStatus: 'pending', files, requests: [], uploads: [], pendingRevocations: [] }),
     }));
     if (!response.ok) { const error = await response.json<{ error: string; message: string }>(); assert(false, response.status, error.error, error.message); }
-    return json({ id: shareId, shortCode: data.shortCode, passwordProtected: data.password !== undefined, ownerToken, createdAt, expiresAt, files, url: `${new URL(request.url).origin}/s/${data.shortCode ?? shareId}` }, 201);
+    return json({ id: shareId, transferMode, shortCode: data.shortCode, passwordProtected: data.password !== undefined, ownerToken, createdAt, expiresAt, files, url: `${new URL(request.url).origin}/s/${data.shortCode ?? shareId}` }, 201);
   } catch (error) {
     await env.DB.prepare('DELETE FROM shares WHERE id = ?').bind(shareId).run();
     await budget(env, '/release', { id: `share:${shareId}` });

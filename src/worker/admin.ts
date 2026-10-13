@@ -86,7 +86,7 @@ export async function adminApi(request: Request, env: Env, source: string, hash?
       return { shareId: target.shareId, ...(action === 'delete-files' || action === 'set-mode' ? { fileId: target.fileId as string } : {}), ...(action === 'cancel-requests' ? { requestId: target.requestId as string } : {}) };
     });
     assert(new Set(targets.map(target => `${target.shareId}:${target.fileId ?? target.requestId ?? ''}`)).size === targets.length, 400, 'duplicate_bulk_target', '批量操作中存在重复对象');
-    if (action === 'set-mode') assert(['auto', 'p2p', 'turn', 'ws', 'https', 'r2'].includes(String(data.mode)), 400, 'invalid_mode', '传输方式无效');
+    if (action === 'set-mode') assert(['auto', 'lan', 'p2p', 'turn', 'ws', 'https', 'r2'].includes(String(data.mode)), 400, 'invalid_mode', '传输方式无效');
     const results: { target: typeof targets[number]; ok: boolean; status: number; message?: string; cleanupPending?: boolean }[] = [];
     for (let offset = 0; offset < targets.length; offset += 5) {
       const settled = await Promise.allSettled(targets.slice(offset, offset + 5).map(async target => {

@@ -1,4 +1,5 @@
-export type Mode = 'p2p' | 'turn' | 'ws' | 'https' | 'r2';
+export type Mode = 'lan' | 'p2p' | 'turn' | 'ws' | 'https' | 'r2';
+export type ShareTransferMode = 'auto' | 'lan';
 export type RequestStatus = 'requested' | 'connecting' | 'transferring' | 'completed' | 'canceled' | 'failed';
 export type UploadStatus = 'none' | 'uploading' | 'paused' | 'ready' | 'canceled' | 'failed' | 'aborted';
 export interface FileInfo {
@@ -14,6 +15,7 @@ export interface FileInfo {
 }
 export interface ShareInfo {
   id: string;
+  transferMode?: ShareTransferMode;
   shortCode?: string;
   passwordProtected?: boolean;
   expiredReason?: 'owner_inactive';
