@@ -1,5 +1,10 @@
 {
   "defaultShareHours": 2,
+  "chatMaxMembers": 200,
+  "chatMaxMessages": 100,
+  "chatHistoryHours": 24,
+  "chatMessageChars": 2000,
+  "chatMessagesPerMinute": 30,
   "ownerIdleTimeoutMs": 1800000,
   "maxFileBytes": 10737418240,
   "maxShareBytes": 21474836480,

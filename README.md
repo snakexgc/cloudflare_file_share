@@ -6,6 +6,18 @@
 
 项目使用 Wrangler 部署到 Cloudflare。未配置机密变量时，分享页面、P2P 信令与 WS 中继仍可运行；R2 直传和 TURN 需要补齐下文对应的机密变量。已完成的测试与待验证项目见 [验收记录](docs/validation.md)。
 
+## 公共聊天室与用户名
+
+首页 `/` 和 `/chat` 默认进入同一个公共聊天室，无需注册。每个页面先自动获得不重名的临时昵称，可以在「我的用户名」中修改；其他分享页面及管理页也自动加入，通过右下角折叠窗口聊天。原来的链接分享入口移到 `/send`，已有 `/s/...` 链接保持有效。
+
+在线昵称由独立的 SQLite Durable Object `ChatRoom` 串行检查和占用，1–20 个可见字符，采用 NFKC 和不区分大小写的比较，不允许控制字符和尖括号。在线冲突返回明确的 409；保存昵称被占用时仍自动加入并分配临时昵称。关闭页面会释放昵称；异常断网或休眠按现有 `leaseMs`（默认 60 秒）释放。会话令牌仅在当前页面会话中保存，自定义昵称作为本地偏好记忆，不构成账户、密码登录或永久保留名字。页面恢复会话时更新版本，旧页面迟到的离开通知不会移除新连接。
+
+支持实时文字、多行消息、选择或拖入多个文件。聊天文件自动创建普通临时分享，上传者的管理令牌不进入公共消息；服务端验证分享归属，文件名称、大小和有效期均从分享房间读取，带提取密码的分享不能直接发布为公共文件卡片。卡片内可直接下载、查看实际方式与速度、取消或重试，也可打开原分享页。自动传输和内网直传均复用既有 `SendTask` / `ReceiveTask` / `VerifiedSink`，保留断点偏移、预算与 SHA-256 校验；R2 仍执行原管理员授权规则。文件默认 2 小时有效，源端仍受 30 分钟不活跃清理限制；发送者需保持页面可运行，刷新或关闭后本地源文件不会自动恢复。启用 Turnstile 时，聊天室发文件继续要求原有 `create-share` 人机验证。
+
+消息对所有访客可见，默认保留最近 100 条、最长 24 小时。聊天 DO 分开持久化成员和消息，只保存文字与文件元数据。WebSocket 使用休眠接口和自动心跳；不可用时自动改用 HTTP 同步，恢复后重新连接。消息请求以 nonce 去重，重连补齐历史；HTML 作为纯文本显示。可在 `LIMITS` / `examples/limits.json` 配置 `chatMaxMembers`（默认 200，上限 500）、`chatMaxMessages`（100，上限 200）、`chatHistoryHours`（24，上限 168）、`chatMessageChars`（2000，上限 4000）、`chatMessagesPerMinute`（30，上限 120，改名也计入）；同来源会话和全站 API / DO 预算仍生效。[Cloudflare 休眠 WebSocket](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)
+
+新增 `CHAT` binding 与追加的 DO 迁移 `v2`；`wrangler deploy` 创建新类，原 `v1` 保持不变，无新 D1 迁移。聊天 API 为 `/api/chat/sessions`、`/state`、`/ws`、`/name`、`/messages`、`/heartbeat` 与 `/leave`。加入接口公开，其余操作校验会话；所有接口执行同源检查与额度控制。浏览器端到端验收入口为 `npm run test:browser` 后的 `/chat.html`。
+
 ## 内网直传与页面布局
 
 首页提供「自动传输」和「内网直传」两种选择。自动传输保留 P2P → TURN → WS → HTTPS 的现有路径；内网直传适合同一 Wi-Fi 或可互通的局域网设备，使用独立 WebRTC DataChannel，`iceServers` 为空，仅交换私网 IPv4、本地 IPv6 或 mDNS 的 host 候选，客户端与服务端同时过滤 SDP 和 trickle ICE。不使用 STUN / TURN，不复用公网 P2P 预热连接，连接失败后停止并提示原因，不自动回退到任何中继或 R2。[WebRTC 配置](https://www.w3.org/TR/webrtc/#rtcconfiguration-dictionary)

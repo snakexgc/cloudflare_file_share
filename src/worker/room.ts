@@ -624,6 +624,10 @@ export class ShareRoom extends DurableObject<Env> {
           this.room = { ...initial, passwordHash: await createSharePassword(password) }; await this.persist(); return json({ ok: true });
         }
         if (path === '/internal/sweep') { await this.sweep(); await this.persist(); return json({ ok: true }); }
+        if (path === '/internal/chat-attachment' && method === 'POST') {
+          this.ownerAuth(request); assert(!this.state().passwordHash, 409, 'protected_chat_attachment', '带提取密码的分享不能发布到公共聊天室');
+          await this.persist(); return json(this.snapshot());
+        }
         if (path === '/internal/admin/ws-usage') return json({ transfers: [...this.relays.values()].map(relay => ({ id: this.state().requests.find(task => task.id === relay.requestId)?.reservationId, bytes: relay.bytes })) });
         if (path === '/internal/admin/https-usage') return json({ transfers: this.state().requests.filter(task => task.mode === 'https' && active(task) && task.reservationId).map(task => ({ id: task.reservationId, bytes: Math.max(task.httpsBytes ?? 0, this.httpsRelays.get(task.transferId)?.bytes ?? 0), activeMs: Math.max(0, Date.now() - (task.httpsStartedAt ?? Date.now())) })) });
         if (path === '/internal/admin/snapshot') return json({ ...this.snapshot(), files: this.state().files.map(({ modeAdminHash: _hash, ...file }) => file), sessions: [...this.sessions.values()].filter(s => this.online(s)).map(s => ({ id: s.id, role: s.role, lastSeen: this.seenAt(s), capabilities: s.capabilities })), requests: this.state().requests.map(({ adminGrant: _grant, ...task }) => task) });

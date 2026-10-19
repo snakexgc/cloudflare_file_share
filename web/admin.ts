@@ -16,7 +16,7 @@ type Target = { shareId: string; fileId?: string; requestId?: string };
 type BulkAction = 'revoke-shares' | 'delete-files' | 'set-mode' | 'cancel-requests';
 export async function adminMain() {
   const app = document.querySelector('#app')!; let timer: ReturnType<typeof setInterval> | undefined;
-  const shell = (html: string) => { app.innerHTML = `<header class="header"><a class="brand" href="/">临时传</a><span class="header-note">管理控制台</span><a class="header-link" href="/">返回分享</a></header><main class="admin-main">${html}</main>`; };
+  const shell = (html: string) => { app.innerHTML = `<header class="header"><a class="brand" href="/">临时传</a><span class="header-note">管理控制台</span><nav class="header-nav" aria-label="页面导航"><a href="/">聊天室</a><a class="header-link" href="/send">链接分享</a></nav></header><main class="admin-main">${html}</main>`; };
   const message = (text: string) => { const el = document.querySelector('#admin-message'); if (el) el.textContent = text; };
   async function login() {
     clearInterval(timer); shell(`<section class="card admin-login"><span class="eyebrow">ADMIN / 管理登录</span><h1>管理你的分享服务</h1><p>输入管理密码，查看用量和管理分享。</p><form id="admin-login"><label for="admin-password">管理密码</label><input id="admin-password" type="password" autocomplete="current-password" required maxlength="1024"/><button class="button primary" type="submit">登录管理台</button></form><p id="admin-message" role="alert"></p></section>`);

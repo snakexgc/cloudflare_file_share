@@ -1,5 +1,6 @@
 import type { ShareRoom } from './room';
 import type { TURNBudget } from './budget';
+import type { ChatRoom } from './chat';
 import { FRAME_HEADER_BYTES, MULTIPART_MAX_PARTS, MULTIPART_MIN_PART_BYTES, SINGLE_PUT_MAX_BYTES, WS_DEFAULT_PAYLOAD_BYTES, WS_MAX_MESSAGE_BYTES } from '../shared/protocol';
 
 export interface Env {
@@ -8,6 +9,7 @@ export interface Env {
   ASSETS: Fetcher;
   ROOMS: DurableObjectNamespace<ShareRoom>;
   BUDGET: DurableObjectNamespace<TURNBudget>;
+  CHAT: DurableObjectNamespace<ChatRoom>;
   LIMITS?: string;
   R2_BUCKET_NAME: string;
   R2_ACCOUNT_ID?: string;
@@ -24,6 +26,11 @@ export interface Env {
 }
 export const defaults = {
   defaultShareHours: 2,
+  chatMaxMembers: 200,
+  chatMaxMessages: 100,
+  chatHistoryHours: 24,
+  chatMessageChars: 2000,
+  chatMessagesPerMinute: 30,
   ownerIdleTimeoutMs: 30 * 60000,
   maxFileBytes: 10 * 1024 ** 3,
   maxShareBytes: 20 * 1024 ** 3,
@@ -95,6 +102,7 @@ export function limits(env: Pick<Env, 'LIMITS'>): Limits {
   if (result.chunkBytes + FRAME_HEADER_BYTES > WS_MAX_MESSAGE_BYTES || result.chunkBytes > result.windowBytes || result.windowBytes > result.roomBufferBytes || result.roomBufferBytes > 64 * 1024 ** 2 || result.rtcChunkBytes + FRAME_HEADER_BYTES > 65536 || result.rtcChunkBytes > result.rtcWindowBytes || result.rtcWindowBytes > 32 * 1024 ** 2 || result.hashChunkBytes > 32 * 1024 ** 2) throw new Error('数据块、窗口与缓冲配置不一致');
   if (result.httpsChunkBytes > 50 * 1024 ** 2 || result.httpsChunkBytes > result.roomBufferBytes) throw new Error('HTTPS 数据块不得超过 50 MiB 或房间缓冲上限');
   if (result.defaultShareHours > 24) throw new Error('默认分享有效期不得超过 24 小时');
+  if (result.chatMaxMembers > 500 || result.chatMaxMessages > 200 || result.chatHistoryHours > 168 || result.chatMessageChars > 4000 || result.chatMessagesPerMinute > 120) throw new Error('聊天室成员、历史或消息限制超出范围');
   if (result.multipartPartBytes < MULTIPART_MIN_PART_BYTES || result.multipartPartBytes > SINGLE_PUT_MAX_BYTES || result.maxFileBytes > MULTIPART_MAX_PARTS * result.multipartPartBytes) throw new Error('Multipart 参数超出 R2 限制');
   return result;
 }

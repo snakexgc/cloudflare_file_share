@@ -9,6 +9,7 @@ import { meteredDB } from './db';
 import { validShortCode } from './share-access';
 export { ShareRoom } from './room';
 export { TURNBudget } from './budget';
+export { ChatRoom } from './chat';
 
 const securityHeaders = {
   'X-Content-Type-Options': 'nosniff',
@@ -71,15 +72,19 @@ async function handle(request: Request, env: Env): Promise<Response> {
     const admin = await adminHash(request, env);
     const adminRoute = url.pathname.startsWith('/api/admin/');
     const budgetBearer = url.pathname === '/api/admin/budget' && env.ADMIN_TOKEN && constantEqual(digest(request.headers.get('Authorization') ?? ''), digest(`Bearer ${env.ADMIN_TOKEN}`));
-    await budget(env, '/charge', { source, room: url.pathname.startsWith('/api/shares/'), create: url.pathname === '/api/shares' && request.method === 'POST', cleanup: Boolean(adminRoute && (admin || budgetBearer)) || request.method === 'DELETE' || (request.method === 'POST' && (url.pathname.endsWith('/abort') || url.pathname.endsWith('/failure'))) });
+    await budget(env, '/charge', { source, room: url.pathname.startsWith('/api/shares/') || url.pathname.startsWith('/api/chat/'), create: url.pathname === '/api/shares' && request.method === 'POST', cleanup: Boolean(adminRoute && (admin || budgetBearer)) || request.method === 'DELETE' || url.pathname === '/api/chat/leave' || (request.method === 'POST' && (url.pathname.endsWith('/abort') || url.pathname.endsWith('/failure'))) });
     if (adminRoute) return adminApi(request, env, source, admin);
+    if (url.pathname.startsWith('/api/chat/')) {
+      const headers = new Headers(request.headers); headers.set('X-File-Share-Source', source);
+      return env.CHAT.get(env.CHAT.idFromName('public')).fetch(new Request(request, { headers }));
+    }
     if (url.pathname === '/api/config' && request.method === 'GET') {
       const conf = limits(env);
       return json({ limits: { ...conf, r2Enabled: Boolean(admin) && conf.r2Enabled }, admin: Boolean(admin), r2Configured: Boolean(admin) && r2Configured(env), ...turnConfiguration(env), turnstileSiteKey: env.TURNSTILE_SITE_KEY ?? null, challengeRequired: Boolean(env.TURNSTILE_SECRET_KEY), stunServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] });
     }
     if (url.pathname === '/api/presence' && request.method === 'POST') {
       const data = await readJson(request, 1024);
-      assert(typeof data.id === 'string' && ID_PATTERN.test(data.id) && typeof data.page === 'string' && /^(\/|\/admin|\/s\/[a-z0-9_-]{3,32})$/.test(data.page), 400, 'invalid_presence', '在线状态无效');
+      assert(typeof data.id === 'string' && ID_PATTERN.test(data.id) && typeof data.page === 'string' && /^(\/|\/chat|\/send|\/admin\/?|\/s\/[a-z0-9_-]{3,32})$/.test(data.page), 400, 'invalid_presence', '在线状态无效');
       await env.DB.prepare('INSERT INTO presence (id, page, last_seen) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET page = excluded.page, last_seen = excluded.last_seen').bind(data.id, data.page, Date.now()).run();
       return json({ ok: true });
     }
