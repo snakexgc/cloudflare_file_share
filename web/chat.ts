@@ -35,7 +35,7 @@ export class ChatView {
   constructor(private root: HTMLElement, private config: PublicConfig, private compact = false) {
     this.client = new ChatClient(config.limits.wsHandshakeMs); this.transfers = new ChatTransfers(config);
     root.classList.add('chat-root'); if (compact) root.classList.add('chat-compact');
-    root.innerHTML = `${compact ? `<button class="chat-dock-toggle button primary" aria-expanded="false" aria-controls="chat-dock-panel">${chatIcon}<span>聊天室</span><span class="chat-dock-count">…</span></button><div id="chat-dock-panel" class="chat-dock-panel" hidden>` : '<section class="chat-intro"><div><div class="eyebrow"><span class="live-dot"></span> 打开即加入，一起聊一聊</div><h1>公共聊天室</h1><p>发条消息，或直接把文件分享给在场的人。</p></div><a href="/send" class="button secondary">创建链接分享</a></section>'}
+    root.innerHTML = `${compact ? `<button class="chat-dock-toggle button primary" aria-expanded="false" aria-controls="chat-dock-panel">${chatIcon}<span>聊天室</span><span class="chat-dock-count">…</span></button><div id="chat-dock-panel" class="chat-dock-panel" hidden>` : '<section class="chat-intro"><div><div class="eyebrow"><span class="live-dot"></span> 打开即加入，一起聊一聊</div><h1>公共聊天室</h1><p>发条消息，或直接把文件分享给在场的人。</p></div><a href="/send" data-page-mode="share" class="button secondary">切换到普通模式</a></section>'}
       <div class="chat-layout card"><section class="chat-board" aria-label="公共聊天室">
         <header class="chat-board-heading"><span class="chat-heading-icon">${chatIcon}</span><div><h2>所有人都在这里</h2><span class="chat-online-count">正在加入…</span></div><span class="chat-connection" role="status">正在连接</span>${compact ? '<button class="chat-close" aria-label="收起聊天室">×</button>' : ''}</header>
         <div class="chat-notice" role="status" hidden></div><p class="chat-error" role="alert" hidden></p>
@@ -176,7 +176,7 @@ export class ChatView {
     if (!this.config.turnstileSiteKey) { this.error('服务端已要求文件验证，但尚未配置验证组件'); return; }
     try {
       if (!this.turnstile) await new Promise<void>((resolve, reject) => {
-        const existing = document.querySelector<HTMLScriptElement>('script[data-chat-turnstile]');
+        const existing = document.querySelector<HTMLScriptElement>('script[src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"]');
         if (existing) { existing.addEventListener('load', () => resolve(), { once: true }); existing.addEventListener('error', () => reject(new Error('验证组件加载失败')), { once: true }); return; }
         const script = document.createElement('script'); script.dataset.chatTurnstile = 'true'; script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit'; script.async = true; script.onload = () => resolve(); script.onerror = () => reject(new Error('验证组件加载失败')); (document.head as unknown as HTMLHeadElement).appendChild(script);
       });

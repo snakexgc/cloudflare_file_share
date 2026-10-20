@@ -27,6 +27,15 @@ input, select { color: #20293b; }
 .header-link { font-size: 14px; }
 .header > .header-link { margin-left: auto; }
 main { flex: 1; }
+.page-mode-switch { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; max-width: 880px; margin: 24px auto 0; padding: 6px; border: 1px solid #e0e5ef; border-radius: 13px; background: #fff; box-shadow: 0 4px 15px #24334e04; }
+.page-mode-switch > a { display: flex; align-items: center; gap: 12px; min-width: 0; padding: 13px 16px; border: 1px solid transparent; border-radius: 9px; transition: background .15s, border-color .15s; color: #64718a; }
+.page-mode-switch > a:hover { background: #f6f7fc; }
+.page-mode-switch > a[aria-current=page] { background: #f0f3ff; border-color: #dbe2ff; color: var(--blue); }
+.page-mode-switch > a > span:not(.page-mode-tag) { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.page-mode-switch strong { color: #29364e; font-size: 15px; font-weight: 600; }
+.page-mode-switch > a[aria-current=page] strong { color: var(--blue); }
+.page-mode-switch small { color: var(--muted); font-size: 12px; }
+.page-mode-tag { margin-left: auto; font-size: 11px; color: #6c7bb4; background: #e7ecfc; border-radius: 5px; padding: 2px 6px; white-space: nowrap; }
 .hero, .share-hero { padding: 38px 0 28px; text-align: center; }
 .eyebrow { font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 8px; color: var(--muted); }
 .hero .eyebrow, .share-hero .eyebrow { justify-content: center; }
@@ -263,6 +272,12 @@ td:first-child { overflow-wrap: anywhere; max-width: 260px; }
   .admin-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 700px) {
+  .page-mode-switch { margin-top: 18px; gap: 4px; padding: 5px; }
+  .page-mode-switch > a { gap: 8px; padding: 11px 9px; align-items: flex-start; }
+  .page-mode-switch .icon { width: 17px; height: 17px; margin-top: 2px; }
+  .page-mode-switch strong { font-size: 14px; }
+  .page-mode-switch small { font-size: 11px; line-height: 1.6; }
+  .page-mode-tag { display: none; }
   .header, main, footer { width: calc(100% - 32px); }
   .header { height: 66px; gap: 16px; }
   .brand { font-size: 19px; }

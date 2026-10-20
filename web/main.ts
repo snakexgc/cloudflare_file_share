@@ -51,13 +51,40 @@ let challengeToken = '';
 let ended = false;
 let createdPassword = '';
 let transferTimer: ReturnType<typeof setInterval> | undefined;
+type PageMode = 'chat' | 'share';
+let pageMode: PageMode = location.pathname === '/' || location.pathname === '/chat' ? 'chat' : 'share';
+let normalRoute = pageMode === 'share' ? `${location.pathname}${location.search}${location.hash}` : '/send';
+let normalReady = false;
 const speedMeters = new Map<string, TransferSpeed>();
 const lastModes = new Map<string, string>();
 const $ = <T extends HTMLElement = HTMLElement>(selector: string) => document.querySelector<T>(selector)!;
 function escape(value: string) { return value.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!); }
 function size(bytes: number) { if (!bytes) return '0 B'; const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']; const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), 4); return `${(bytes / 1024 ** i).toLocaleString('zh-CN', { maximumFractionDigits: i ? 1 : 0 })} ${units[i]}`; }
 function shell(content: string) {
-  app.innerHTML = `<header class="header"><a href="/" class="brand"><span class="brand-mark">${icon('arrows')}</span><span>临时传</span></a><span class="header-note">轻一点分享，少一点等待</span><nav class="header-nav" aria-label="页面导航"><a href="/">聊天室</a><a href="/send">链接分享</a><a class="header-link" href="/admin">${config?.admin ? '管理台 · 已登录' : '管理登录'}</a></nav></header><main>${content}</main><footer><span>文件来去自如，分享有始有终。</span><span>${icon('shield')} 原文件交付 · 完整性校验 · 按时失效</span></footer><div id="toast" role="status" aria-live="polite"></div>`;
+  frame(); $('#normal-page').innerHTML = content; normalReady = true;
+}
+function frame() {
+  if (document.querySelector('#page-mode-switch')) return;
+  app.innerHTML = `<header class="header"><a href="/" class="brand" data-page-mode="chat"><span class="brand-mark">${icon('arrows')}</span><span>临时传</span></a><span class="header-note">轻一点分享，少一点等待</span><nav class="header-nav" aria-label="页面导航"><a href="/" data-page-mode="chat">聊天室</a><a href="/send" data-page-mode="share">普通模式</a><a class="header-link" href="/admin">${config?.admin ? '管理台 · 已登录' : '管理登录'}</a></nav></header><main><nav id="page-mode-switch" class="page-mode-switch" aria-label="分享模式"><a href="/" data-page-mode="chat">${icon('network')}<span><strong>聊天室模式</strong><small>与在线成员聊天、发送文件</small></span><span class="page-mode-tag">默认</span></a><a href="/send" data-page-mode="share">${icon('link')}<span><strong>普通模式</strong><small>生成分享链接，发送给需要的人</small></span></a></nav><p id="page-error" class="error-message" role="alert" hidden></p><section id="chat-page" aria-label="聊天室模式"></section><section id="normal-page" aria-label="普通链接分享模式"></section></main><footer><span>文件来去自如，分享有始有终。</span><span>${icon('shield')} 原文件交付 · 完整性校验 · 按时失效</span></footer><div id="toast" role="status" aria-live="polite"></div>`;
+  updatePageMode();
+}
+function updatePageMode() {
+  $('#chat-page').hidden = pageMode !== 'chat'; $('#normal-page').hidden = pageMode !== 'share';
+  document.querySelectorAll<HTMLAnchorElement>('[data-page-mode]').forEach(link => {
+    const active = link.dataset.pageMode === pageMode;
+    if (active) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current');
+    if (link.dataset.pageMode === 'share') link.href = normalRoute;
+  });
+}
+function showPageMode(mode: PageMode, push = true) {
+  pageMode = mode;
+  if (mode === 'share' && !normalReady && config && !share && !/^\/s\//.test(normalRoute)) initializeNormalHome();
+  updatePageMode();
+  const route = mode === 'chat' ? '/' : normalRoute;
+  if (push && `${location.pathname}${location.search}${location.hash}` !== route) history.pushState({ mode }, '', route);
+}
+function initializeNormalHome() {
+  renderHome(); $('#file-limit').textContent = `单文件最高 ${size(config.limits.maxFileBytes)} · 总计最高 ${size(config.limits.maxShareBytes)}`; network(); void setupChallenge();
 }
 function inactivityNote() { return `分享者连续 ${((config?.limits.ownerIdleTimeoutMs ?? 1800000) / 60000).toLocaleString('zh-CN', { maximumFractionDigits: 2 })} 分钟不活跃时，分享和云端文件会提前销毁。`; }
 function network() { if (config) mountProbes({ ...config, lanOnly: (share?.transferMode ?? transferMode) === 'lan', httpOnly: control?.httpOnly || share?.files.some(file => file.forcedMode === 'https') }, () => { peers?.retest(); }); }
@@ -120,7 +147,9 @@ async function create() {
     ownerToken = result.ownerToken; result.files.forEach((file, index) => sources.set(file.id, selected[index]));
     selected = [];
     share = { ...result, status: 'active', cleanupStatus: 'pending', ownerStatus: 'online', activeRequests: 0 };
-    history.pushState({}, '', `${new URL(result.url).pathname}#owner=${ownerToken}`); renderShare(); await startControl();
+    normalRoute = `${new URL(result.url).pathname}#owner=${ownerToken}`;
+    if (pageMode === 'share') history.pushState({ mode: 'share' }, '', normalRoute);
+    updatePageMode(); renderShare(); await startControl();
   } catch (failure) { error(failure instanceof Error ? failure.message : '分享创建失败'); button.disabled = false; button.innerHTML = `生成分享链接 ${icon('arrows')}`; }
 }
 function renderShare() {
@@ -132,6 +161,7 @@ function renderShare() {
     $('#qr-toggle').onclick = () => { const panel = $('#qr-panel'); panel.hidden = !panel.hidden; if (!panel.hidden) void QRCode.toCanvas($<HTMLCanvasElement>('#qr'), link, { width: 176, margin: 1, color: { dark: '#24385c', light: '#ffffff' } }); };
     $('#restore').onchange = () => { void restoreSources(Array.from($<HTMLInputElement>('#restore').files ?? [])); };
     $('#revoke').onclick = () => { void revoke(); };
+    const nextShare = document.createElement('a'); nextShare.href = '/send'; nextShare.target = '_blank'; nextShare.rel = 'noopener noreferrer'; nextShare.className = 'text-button'; nextShare.textContent = '新建普通分享 ↗'; nextShare.title = '在新页面创建，当前分享继续保持在线'; $('.source-restore').appendChild(nextShare);
     if (createdPassword) {
       const password = document.createElement('div'); password.className = 'share-password-summary';
       password.innerHTML = '<span>已设置提取密码</span><button class="text-button" type="button">复制链接和提取密码</button>';
@@ -320,29 +350,43 @@ async function revoke() {
 async function setupChallenge() {
   if (!config.challengeRequired) return;
   if (!config.turnstileSiteKey) { error('服务端已要求人机验证，但尚未配置验证组件'); $<HTMLButtonElement>('#create').disabled = true; return; }
-  const script = document.createElement('script'); script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit'; script.async = true;
-  script.onload = () => {
+  const render = () => {
     const turnstile = (window as unknown as { turnstile: { render(element: HTMLElement, options: object): void } }).turnstile;
     turnstile.render($('#challenge'), { sitekey: config.turnstileSiteKey, action: 'create-share', callback: (value: string) => { challengeToken = value; }, 'expired-callback': () => { challengeToken = ''; } });
   };
-  (document.head as unknown as HTMLHeadElement).appendChild(script);
+  if ((window as unknown as { turnstile?: { render?: unknown } }).turnstile?.render) { render(); return; }
+  const existing = document.querySelector<HTMLScriptElement>('script[src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"]');
+  const script = existing ?? document.createElement('script'); script.addEventListener('load', render, { once: true });
+  if (!existing) { script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit'; script.async = true; (document.head as unknown as HTMLHeadElement).appendChild(script); }
 }
 async function main() {
   const presenceId = crypto.randomUUID().replaceAll('-', '');
   const presence = () => { void api('/api/presence', undefined, { id: presenceId, page: location.pathname }).catch(() => {}); };
   presence(); const presenceTimer = setInterval(presence, 30000); window.addEventListener('pagehide', () => clearInterval(presenceTimer), { once: true });
   if (location.pathname === '/admin' || location.pathname === '/admin/') { void api<PublicConfig>('/api/config').then(value => mountChat(value)).catch(() => {}); await adminMain(); return; }
+  frame();
+  document.addEventListener('click', event => {
+    if (event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    const link = (event.target as Element).closest<HTMLAnchorElement>('a[data-page-mode]');
+    if (!link || !['chat', 'share'].includes(link.dataset.pageMode ?? '')) return;
+    event.preventDefault(); showPageMode(link.dataset.pageMode as PageMode);
+    document.querySelector<HTMLAnchorElement>(`#page-mode-switch [data-page-mode="${pageMode}"]`)?.focus();
+  });
+  window.addEventListener('popstate', () => {
+    if (location.pathname === '/' || location.pathname === '/chat') showPageMode('chat', false);
+    else if (`${location.pathname}${location.search}${location.hash}` === normalRoute) showPageMode('share', false);
+    else location.reload();
+  });
   window.addEventListener('focus', () => { void (async () => { if (!config) return; try { const next = await api<PublicConfig>('/api/config'); if (next.admin !== config.admin) { config = next; const link = document.querySelector<HTMLAnchorElement>('.header-link'); if (link) link.textContent = config.admin ? '管理台 · 已登录' : '管理登录'; document.querySelectorAll('.mode-choice').forEach(x => x.remove()); modes(); network(); } } catch { /* 原有传输继续运行，后端仍验证授权。 */ } })(); });
   const match = location.pathname.match(/^\/s\/([a-z0-9_-]{3,32})$/);
-  const chatHome = location.pathname === '/' || location.pathname === '/chat';
-  if (chatHome) shell('<div id="chat-page"><section class="hero"><h1>正在进入聊天室…</h1><p id="error" class="error-message" role="alert" hidden></p></section></div>');
-  else if (!match) renderHome(); else shell('<section class="hero"><div class="eyebrow">临时传</div><h1>正在读取分享…</h1><p id="error" class="error-message" role="alert" hidden></p></section>');
+  $('#chat-page').innerHTML = '<section class="hero"><h1>正在进入聊天室…</h1></section>';
+  $('#normal-page').innerHTML = `<section class="hero"><h1>${match ? '正在读取分享…' : '正在读取分享设置…'}</h1></section>`;
   try {
     config = await api<PublicConfig>('/api/config');
-    if (chatHome) { mountChat(config, $('#chat-page')); return; }
-    mountChat(config);
-    if (!match) { renderHome(); $('#file-limit').textContent = `单文件最高 ${size(config.limits.maxFileBytes)} · 总计最高 ${size(config.limits.maxShareBytes)}`; network(); void setupChallenge(); return; }
-    ownerToken = new URLSearchParams(location.hash.slice(1)).get('owner') ?? undefined;
+    const adminLink = document.querySelector<HTMLAnchorElement>('.header-link'); if (adminLink) adminLink.textContent = config.admin ? '管理台 · 已登录' : '管理登录';
+    mountChat(config, $('#chat-page'));
+    if (!match) { if (pageMode === 'share') initializeNormalHome(); return; }
+    ownerToken = new URLSearchParams(new URL(normalRoute, location.origin).hash.slice(1)).get('owner') ?? undefined;
     if (ownerToken && !/^[a-f0-9]{64}$/.test(ownerToken)) ownerToken = undefined;
     try { share = await api<ShareInfo>(`/api/shares/${match[1]}`, ownerToken); }
     catch (failure) {
@@ -350,7 +394,7 @@ async function main() {
       if (failure instanceof ApiError && failure.status === 410 && (failure.details as { share?: ShareInfo })?.share) share = (failure.details as { share: ShareInfo }).share; else throw failure;
     }
     renderShare(); if (!ended) await startControl();
-  } catch (failure) { error(failure instanceof Error ? failure.message : '服务暂时不可用'); }
+  } catch (failure) { $('#page-error').textContent = failure instanceof Error ? failure.message : '服务暂时不可用'; $('#page-error').hidden = false; }
 }
 function renderUnlock(reference: string) {
   shell('<section class="card share-unlock"><span class="eyebrow">受密码保护的分享</span><h1>输入提取密码</h1><p>验证后即可查看文件并下载。</p><form id="unlock-form"><label for="extraction-password">提取密码</label><input id="extraction-password" type="password" minlength="4" maxlength="64" autocomplete="off" required autofocus/><button class="button primary" type="submit">查看文件</button></form><p id="error" class="error-message" role="alert" hidden></p></section>');
