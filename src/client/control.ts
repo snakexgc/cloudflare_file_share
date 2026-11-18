@@ -23,7 +23,7 @@ export class ControlSession {
   private binaryInFlight = new Map<string, number>();
   private httpTasks = new Set<string>();
   httpOnly = false;
-  constructor(public shareId: string, public role: 'owner' | 'receiver', public capabilities: Capabilities, private conf: Limits, private ownerToken?: string) {}
+  constructor(public shareId: string, public role: 'owner' | 'receiver', public capabilities: Capabilities, private conf: Limits, private ownerToken?: string, private receiverPassword?: string) {}
   get base() { return `/api/shares/${this.shareId}`; }
   get ws() { return this.socket?.readyState === 1; }
   private get httpControl() { return this.httpOnly || this.httpTasks.size > 0 || !this.ws; }
@@ -55,12 +55,14 @@ export class ControlSession {
   }
   async start() {
     this.stopped = false;
-    const result = await api<{ sessionId: string; sessionToken: string }>(`${this.base}/sessions`, this.ownerToken, { role: this.role, capabilities: this.capabilities });
+    const result = await api<{ sessionId: string; sessionToken: string }>(`${this.base}/sessions`, this.ownerToken, { role: this.role, capabilities: this.capabilities, ...(this.receiverPassword ? { password: this.receiverPassword } : {}) });
+    if (this.stopped) return;
     this.sessionId = result.sessionId; this.sessionToken = result.sessionToken;
     if (!this.httpOnly && this.capabilities.ws && typeof WebSocket === 'function') {
       try { this.connecting ??= this.connect(); await this.connecting; } catch { this.socket?.close(); this.socket = undefined; } finally { this.connecting = undefined; }
     }
     await this.heartbeat();
+    if (this.stopped) return;
     if (!this.ws) this.useHttp(); else this.onState('ws');
     this.timer = setInterval(() => {
       if (!this.httpControl && this.ws && this.socket!.bufferedAmount === 0 && !this.binaryInFlight.size) this.socket!.send('{"type":"ping"}');

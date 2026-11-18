@@ -628,6 +628,13 @@ export class ShareRoom extends DurableObject<Env> {
           this.ownerAuth(request); assert(!this.state().passwordHash, 409, 'protected_chat_attachment', '带提取密码的分享不能发布到公共聊天室');
           await this.persist(); return json(this.snapshot());
         }
+        if (path === '/internal/messenger-attachment' && method === 'POST') {
+          this.ownerAuth(request); this.ensureActive();
+          const passwordHash = this.state().passwordHash;
+          const data = await readJson(request, 1024);
+          assert(passwordHash && await verifySharePassword(data.password, passwordHash), 403, 'invalid_share_password', '需要此传输房间的提取密码');
+          return json(this.snapshot());
+        }
         if (path === '/internal/admin/ws-usage') return json({ transfers: [...this.relays.values()].map(relay => ({ id: this.state().requests.find(task => task.id === relay.requestId)?.reservationId, bytes: relay.bytes })) });
         if (path === '/internal/admin/https-usage') return json({ transfers: this.state().requests.filter(task => task.mode === 'https' && active(task) && task.reservationId).map(task => ({ id: task.reservationId, bytes: Math.max(task.httpsBytes ?? 0, this.httpsRelays.get(task.transferId)?.bytes ?? 0), activeMs: Math.max(0, Date.now() - (task.httpsStartedAt ?? Date.now())) })) });
         if (path === '/internal/admin/snapshot') return json({ ...this.snapshot(), files: this.state().files.map(({ modeAdminHash: _hash, ...file }) => file), sessions: [...this.sessions.values()].filter(s => this.online(s)).map(s => ({ id: s.id, role: s.role, lastSeen: this.seenAt(s), capabilities: s.capabilities })), requests: this.state().requests.map(({ adminGrant: _grant, ...task }) => task) });
@@ -668,15 +675,21 @@ export class ShareRoom extends DurableObject<Env> {
           const secret = token(); state.accessGrants.push({ hash: digest(secret), expiresAt: state.expiresAt }); await this.persist();
           const response = json({ unlocked: true }); response.headers.set('Set-Cookie', accessCookie(request, state.id, secret, state.expiresAt)); return response;
         }
-        if (route === '' && method === 'GET' || route === '/sessions' && method === 'POST') await this.ensureAccess(request);
         if (route === '' && method === 'GET') {
+          await this.ensureAccess(request);
           this.ensureActive();
           if (constantEqual(digest(bearer(request)), this.state().ownerTokenHash)) { this.state().lastOwnerActiveAt = Date.now(); await this.persist(); }
           return json(this.snapshot());
         }
         if (route === '' && method === 'DELETE') { this.ownerAuth(request, true); if (this.state().status === 'active') this.state().status = 'revoked'; await this.cleanup(); await this.persist(); return json({ share: this.snapshot() }); }
         if (route === '/sessions' && method === 'POST') {
-          this.ensureActive(); const data = await readJson(request), role = data.role === 'owner' ? 'owner' : 'receiver';
+          const data = await readJson(request), role = data.role === 'owner' ? 'owner' : 'receiver';
+          const passwordHash = this.state().passwordHash;
+          if (role === 'receiver' && passwordHash && data.password !== undefined) {
+            await budget(this.env, '/share-unlock', { source: request.headers.get('X-File-Share-Source') ?? 'local', shareId: this.state().id });
+            assert(await verifySharePassword(data.password, passwordHash), 403, 'invalid_share_password', '提取密码错误');
+          } else await this.ensureAccess(request);
+          this.ensureActive();
           if (role === 'owner') assert(constantEqual(digest(bearer(request)), this.state().ownerTokenHash), 403, 'owner_forbidden', '管理令牌无效');
           await this.pruneSessions();
           assert(this.sessions.size < limits(this.env).maxSessions, 429, 'session_limit', '此分享的会话数量已达上限');

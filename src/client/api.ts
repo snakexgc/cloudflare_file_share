@@ -10,7 +10,9 @@ export async function api<T>(path: string, token?: string, body?: unknown, metho
   if (!response.ok) throw new ApiError(response.status, data.error ?? 'request_failed', data.message ?? `请求失败 (${response.status})`, data.details);
   return data as T;
 }
-export function makeId() { return crypto.randomUUID().replaceAll('-', ''); }
+export function makeId() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
+}
 export function delay(ms: number, signal?: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
     if (signal?.aborted) { reject(signal.reason); return; }

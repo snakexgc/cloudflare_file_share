@@ -1,14 +1,7 @@
 type Icon = (name: 'arrows' | 'upload' | 'shield' | 'clock' | 'network' | 'link' | 'download') => string;
 
 export function homeContent(hours: number, inactivity: string, icon: Icon, mode: 'auto' | 'lan'): string {
-  return `<section class="hero home-hero">
-    <div class="eyebrow"><span class="live-dot"></span> 无需注册，即传即用</div>
-    <h1>让文件，<span>轻松抵达。</span></h1>
-    <p>选择文件，分享链接。在不同网络间分享，也能在同一局域网内直接传输。</p>
-  </section>
-  <div class="workspace">
-    <section class="card upload-card">
-      <div class="card-heading"><span class="heading-icon">${icon('upload')}</span><div><h2>发送文件</h2><p>保留原文件，让分享更简单。</p></div><span class="step-label">创建分享</span></div>
+  return `<div class="workspace"><section class="card upload-card"><div class="card-heading"><div><h1>创建分享链接</h1></div></div>
       <fieldset class="mode-picker"><legend>传输方式</legend><div class="mode-options">
         <label class="mode-option"><input type="radio" name="transfer-mode" value="auto" ${mode === 'auto' ? 'checked' : ''}/><span class="mode-option-icon">${icon('arrows')}</span><span><strong>自动传输 <small>推荐</small></strong><span>跨网络分享，P2P 直连优先</span></span><span class="mode-check" aria-hidden="true"></span></label>
         <label class="mode-option"><input type="radio" name="transfer-mode" value="lan" ${mode === 'lan' ? 'checked' : ''}/><span class="mode-option-icon">${icon('network')}</span><span><strong>内网直传</strong><span>同一 Wi-Fi / 局域网内传输</span></span><span class="mode-check" aria-hidden="true"></span></label>
@@ -27,10 +20,6 @@ export function homeContent(hours: number, inactivity: string, icon: Icon, mode:
       <div class="waiting-note">${icon('shield')} 点击下载后才传输文件，请保持此页面打开。</div>
       <p class="expiry-note">${icon('clock')} 默认 ${hours} 小时，最长 24 小时。${inactivity}</p>
     </section>
-    <aside id="how" class="how-panel"><div class="how-heading"><h2>三步，完成分享</h2><span>从你的设备，传到对方的设备</span></div><ol class="instructions">
-      <li><span>1</span><div><strong>选择文件</strong><p>支持多个文件，原内容完整交付。</p></div></li>
-      <li><span>2</span><div><strong>分享链接</strong><p>复制链接或让对方扫描二维码。</p></div></li>
-      <li><span>3</span><div><strong>等待接收</strong><p id="how-transfer">${mode === 'lan' ? '连接同一 Wi-Fi，双方保持页面打开。' : '双方保持在线，点击下载即开始。'}</p></div></li>
-    </ol></aside>
+
   </div>`;
 }

@@ -7,6 +7,7 @@ import { ID_PATTERN, validHours } from '../shared/protocol';
 import { r2Configured } from './r2';
 import { meteredDB } from './db';
 import { validShortCode } from './share-access';
+import { messengerApi, sweepMessenger } from './messenger';
 export { ShareRoom } from './room';
 export { TURNBudget } from './budget';
 export { ChatRoom } from './chat';
@@ -74,6 +75,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
     const budgetBearer = url.pathname === '/api/admin/budget' && env.ADMIN_TOKEN && constantEqual(digest(request.headers.get('Authorization') ?? ''), digest(`Bearer ${env.ADMIN_TOKEN}`));
     await budget(env, '/charge', { source, room: url.pathname.startsWith('/api/shares/') || url.pathname.startsWith('/api/chat/'), create: url.pathname === '/api/shares' && request.method === 'POST', cleanup: Boolean(adminRoute && (admin || budgetBearer)) || request.method === 'DELETE' || url.pathname === '/api/chat/leave' || (request.method === 'POST' && (url.pathname.endsWith('/abort') || url.pathname.endsWith('/failure'))) });
     if (adminRoute) return adminApi(request, env, source, admin);
+    if (url.pathname.startsWith('/api/messenger/')) return messengerApi(request, env);
     if (url.pathname.startsWith('/api/chat/')) {
       const headers = new Headers(request.headers); headers.set('X-File-Share-Source', source);
       return env.CHAT.get(env.CHAT.idFromName('public')).fetch(new Request(request, { headers }));
@@ -84,7 +86,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
     }
     if (url.pathname === '/api/presence' && request.method === 'POST') {
       const data = await readJson(request, 1024);
-      assert(typeof data.id === 'string' && ID_PATTERN.test(data.id) && typeof data.page === 'string' && /^(\/|\/chat|\/send|\/admin\/?|\/s\/[a-z0-9_-]{3,32})$/.test(data.page), 400, 'invalid_presence', '在线状态无效');
+      assert(typeof data.id === 'string' && ID_PATTERN.test(data.id) && typeof data.page === 'string' && /^(\/|\/chat|\/drive\/?|\/send|\/admin\/?|\/s\/[a-z0-9_-]{3,32})$/.test(data.page), 400, 'invalid_presence', '在线状态无效');
       await env.DB.prepare('INSERT INTO presence (id, page, last_seen) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET page = excluded.page, last_seen = excluded.last_seen').bind(data.id, data.page, Date.now()).run();
       return json({ ok: true });
     }
@@ -139,6 +141,7 @@ export default {
     ctx.waitUntil((async () => {
       await budget(env, '/charge', { source: 'cron', cleanup: true });
       await env.DB.batch([env.DB.prepare('DELETE FROM admin_sessions WHERE expires_at <= ?').bind(Date.now()), env.DB.prepare('DELETE FROM presence WHERE last_seen <= ?').bind(Date.now() - 3600000)]);
+      ctx.waitUntil(sweepMessenger(env, Date.now()));
       let cursor = '';
       while (true) {
         const rows = await env.DB.prepare("SELECT DISTINCT s.id FROM shares s LEFT JOIN cleanup_tasks c ON c.share_id = s.id WHERE s.id > ? AND (((s.expires_at <= ? OR s.status = 'expired') AND s.cleanup_status != 'cleaned') OR s.status = 'revoked' OR c.next_retry_at <= ? OR (s.cleaned_at IS NOT NULL AND s.cleaned_at + ? <= ?)) ORDER BY s.id LIMIT 100").bind(cursor, Date.now(), Date.now(), limits(env).tombstoneMs, Date.now()).all<{ id: string }>();

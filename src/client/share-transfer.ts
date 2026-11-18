@@ -10,7 +10,9 @@ import type { VerifiedSink } from './sink';
 import type { PublicConfig } from './config';
 
 const terminal = (task: DownloadRequest) => ['completed', 'canceled', 'failed'].includes(task.status);
-class TransferConnection {
+type TransferShare = Pick<ShareInfo, 'id' | 'files' | 'expiresAt' | 'transferMode'>;
+
+export class TransferConnection {
   control: ControlSession;
   peers?: PeerManager;
   uploads?: UploadManager;
@@ -20,8 +22,9 @@ class TransferConnection {
   private credits = new Map<string, Record<string, unknown>>();
   private queue: Promise<void> = Promise.resolve();
   private stopped = false;
-  constructor(public share: ShareInfo, private config: PublicConfig, private progress: Progress, private sources = new Map<string, File>(), private ownerToken?: string) {
-    this.control = new ControlSession(share.id, ownerToken ? 'owner' : 'receiver', { webrtc: rtcSupport().available, ws: typeof WebSocket === 'function', https: true, readable: [...sources.keys()] }, config.limits, ownerToken);
+  onTerminal = (_task: DownloadRequest) => {};
+  constructor(public share: TransferShare, private config: PublicConfig, private progress: Progress, private sources = new Map<string, File>(), private ownerToken?: string, receiverPassword?: string) {
+    this.control = new ControlSession(share.id, ownerToken ? 'owner' : 'receiver', { webrtc: rtcSupport().available, ws: typeof WebSocket === 'function', https: true, readable: [...sources.keys()] }, config.limits, ownerToken, receiverPassword);
     if (share.transferMode !== 'lan') {
       this.peers = new PeerManager(this.control, config.stunServers, () => {});
       this.peers.onReady = peer => { for (const receiver of this.receivers.values()) if (!receiver.done && receiver.task.ownerId === peer.ownerId) void receiver.upgrade(peer.id); };
@@ -49,7 +52,7 @@ class TransferConnection {
       } else if (data.type === 'expired') this.stop();
     };
   }
-  async start() { try { await this.control.start(); this.peers?.start(); } catch (error) { this.stop(); throw error; } }
+  async start() { try { await this.control.start(); if (!this.stopped) this.peers?.start(); } catch (error) { this.stop(); throw error; } }
   private async event(event: ControlEvent) {
     if (this.stopped) return;
     if (await this.peers?.event(event)) return;
@@ -85,10 +88,16 @@ class TransferConnection {
       if (receiver) await receiver.event(event);
       else { this.events.push(event); if (this.events.length > this.config.limits.eventQueueSize) this.events.shift(); }
     }
+    if (task && terminal(task)) this.onTerminal(task);
   }
   async receive(file: FileInfo, sink: VerifiedSink) {
+    if (this.stopped) throw new Error('文件连接已关闭');
     for (const [key, task] of this.receivers) if (task.done) this.receivers.delete(key);
     const request = await api<DownloadRequest>(`${this.control.base}/download-requests`, this.control.sessionToken, { fileId: file.id });
+    if (this.stopped) {
+      await api(`${this.control.base}/download-requests/${request.id}`, this.control.sessionToken, undefined, 'DELETE').catch(() => {});
+      throw new Error('文件连接已关闭');
+    }
     const receiver = new ReceiveTask(request, sink, this.control, this.config.limits, this.config.stunServers, this.progress, peerId => this.peers?.get(peerId));
     this.receivers.set(request.id, receiver); await receiver.start();
     const pending = this.events.splice(0);
