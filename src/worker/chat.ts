@@ -1,5 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import { chatName, type ChatAttachment, type ChatEvent, type ChatMember, type ChatMessage, type ChatSnapshot } from '../shared/chat';
+import { MESSENGER_MESSAGE_RETENTION_MS } from '../shared/messenger';
 import type { ShareInfo } from '../shared/types';
 import { ID_PATTERN } from '../shared/protocol';
 import { limits, type Env } from './config';
@@ -10,7 +11,7 @@ interface Member extends ChatMember {
   generation: number;
   rate: { count: number; resetAt: number }; receipts: { nonce: string; messageId: string }[];
 }
-interface Meta { revision: number }
+interface Meta { revision: number; emptySince?: number }
 
 /** One public room serializes name claims and persists bounded history, never file bytes. */
 export class ChatRoom extends DurableObject<Env> {
@@ -31,7 +32,7 @@ export class ChatRoom extends DurableObject<Env> {
   private snapshot(member: Member): ChatSnapshot { return { revision: this.meta.revision, self: this.publicMember(member), members: this.publicMembers(), messages: this.messages, historyHours: limits(this.env).chatHistoryHours }; }
   private seenAt(member: Member) {
     let latest = member.lastSeen;
-    for (const socket of this.ctx.getWebSockets(member.id)) if (socket.readyState === 1) latest = Math.max(latest, this.ctx.getWebSocketAutoResponseTimestamp(socket)?.getTime() ?? 0);
+    for (const socket of this.ctx.getWebSockets(member.id)) latest = Math.max(latest, this.ctx.getWebSocketAutoResponseTimestamp(socket)?.getTime() ?? 0);
     return latest;
   }
   private async persist(member: Member) { await this.ctx.storage.put(`member:${member.id}`, member); }
@@ -47,9 +48,19 @@ export class ChatRoom extends DurableObject<Env> {
   }
   private async prune() {
     const conf = limits(this.env), now = Date.now(); let changed = false;
-    for (const member of this.members.values()) if (this.seenAt(member) + conf.leaseMs <= now) { await this.remove(member); changed = true; }
+    let lastLeaseEnd = 0;
+    for (const member of this.members.values()) {
+      const leaseEnd = this.seenAt(member) + conf.leaseMs;
+      if (leaseEnd > now) continue;
+      lastLeaseEnd = Math.max(lastLeaseEnd, leaseEnd);
+      await this.remove(member); changed = true;
+    }
+    if (changed && !this.members.size) this.meta.emptySince = lastLeaseEnd;
     if (changed) await this.membersChanged();
-    const keep = this.messages.filter(message => message.createdAt + conf.chatHistoryHours * 3600000 > now).slice(-conf.chatMaxMessages);
+    // Older empty rooms did not persist when the last session left.
+    const emptySince = this.meta.emptySince ?? this.messages.at(-1)?.createdAt;
+    const expired = !this.members.size && emptySince !== undefined && emptySince + MESSENGER_MESSAGE_RETENTION_MS <= now;
+    const keep = expired ? [] : this.messages.filter(message => message.createdAt + conf.chatHistoryHours * 3600000 > now).slice(-conf.chatMaxMessages);
     const ids = new Set(keep.map(message => message.id)), removed = this.messages.filter(message => !ids.has(message.id));
     if (removed.length) {
       this.messages = keep;
@@ -60,7 +71,10 @@ export class ChatRoom extends DurableObject<Env> {
   private async schedule() {
     const conf = limits(this.env), now = Date.now();
     const deadlines = [...this.members.values()].map(member => this.seenAt(member) + conf.leaseMs);
-    if (this.messages.length) deadlines.push(this.messages[0].createdAt + conf.chatHistoryHours * 3600000);
+    if (this.messages.length) {
+      deadlines.push(this.messages[0].createdAt + conf.chatHistoryHours * 3600000);
+      if (!this.members.size) deadlines.push((this.meta.emptySince ?? this.messages.at(-1)!.createdAt) + MESSENGER_MESSAGE_RETENTION_MS);
+    }
     if (deadlines.length) await this.ctx.storage.setAlarm(Math.max(now + 1000, Math.min(...deadlines)));
     else await this.ctx.storage.deleteAlarm();
   }
@@ -100,6 +114,7 @@ export class ChatRoom extends DurableObject<Env> {
             if (name && [...this.members.values()].some(value => value.key === name!.key)) { nameUnavailable = true; name = undefined; }
             while (!name) { const generated = chatName(`访客-${id().slice(0, 6)}`)!; if (![...this.members.values()].some(value => value.key === generated.key)) name = generated; }
             secret = token(); member = { id: id(), ...name, generation: 1, joinedAt: Date.now(), lastSeen: Date.now(), sourceHash, tokenHash: digest(secret), rate: { count: 0, resetAt: Date.now() + 60000 }, receipts: [] };
+            delete this.meta.emptySince;
             this.members.set(member.id, member); await this.persist(member); await this.membersChanged();
           } else { member.lastSeen = Date.now(); member.generation++; await this.persist(member); }
           await this.schedule(); return json({ sessionToken: secret, generation: member.generation, nameUnavailable, snapshot: this.snapshot(member) }, 201);
@@ -109,7 +124,11 @@ export class ChatRoom extends DurableObject<Env> {
           assert(typeof secret === 'string' && /^[a-f0-9]{64}$/.test(secret), 401, 'chat_session_expired', '聊天室会话无效');
           const member = this.find(secret);
           assert(data.generation === undefined || typeof data.generation === 'number' && Number.isSafeInteger(data.generation) && data.generation >= 1, 400, 'invalid_chat_generation', '会话版本无效');
-          if (member && (data.generation === undefined || data.generation === member.generation)) { await this.remove(member); await this.membersChanged(); }
+          if (member && (data.generation === undefined || data.generation === member.generation)) {
+            await this.remove(member);
+            if (!this.members.size) this.meta.emptySince = Date.now();
+            await this.membersChanged();
+          }
           await this.schedule(); return json({ ok: true });
         }
         if (route === '/ws' && method === 'GET') {
@@ -162,7 +181,18 @@ export class ChatRoom extends DurableObject<Env> {
     if (message === 'chat-ping') { socket.send('chat-pong'); return; }
     socket.close(typeof message === 'string' ? 1008 : 1003, 'use chat HTTP API');
   }
-  async webSocketClose(_socket: WebSocket) { await this.ctx.blockConcurrencyWhile(async () => { await this.prune(); await this.schedule(); }); }
+  async webSocketClose(socket: WebSocket) {
+    await this.ctx.blockConcurrencyWhile(async () => {
+      const attachment = socket.deserializeAttachment() as { memberId: string } | null;
+      const member = attachment && this.members.get(attachment.memberId);
+      const lastPing = this.ctx.getWebSocketAutoResponseTimestamp(socket)?.getTime();
+      if (member && lastPing !== undefined && lastPing > member.lastSeen) {
+        member.lastSeen = lastPing;
+        await this.persist(member);
+      }
+      await this.prune(); await this.schedule();
+    });
+  }
   async webSocketError(socket: WebSocket) { await this.webSocketClose(socket); }
   async alarm() {
     await this.ctx.blockConcurrencyWhile(async () => { await budget(this.env, '/do-used', { count: 1 }).catch(() => {}); await this.prune(); await this.schedule(); });

@@ -1,7 +1,7 @@
 import { MessengerClient } from '../src/client/messenger';
 import { MessengerFiles } from '../src/client/messenger-files';
 import type { PublicConfig } from '../src/client/config';
-import type { MessengerConversation, MessengerFile, MessengerUser } from '../src/shared/messenger';
+import { MESSENGER_PLAZA_ID, type MessengerConversation, type MessengerFile, type MessengerUser } from '../src/shared/messenger';
 import type { ShareTransferMode } from '../src/shared/types';
 import { avatar, conversationName, escapeHtml as esc, fileSymbol, formatSize, glyph, groupAvatar, iconButton, shortTime, welcome, type PageMode } from './workspace-view';
 import { WorkspaceDialogs } from './workspace-dialogs';
@@ -110,8 +110,16 @@ export class Workspace {
   }
   private render() {
     const s = this.client.state;
-    if (s.self && this.config && this.userId !== s.self.id) {
-      this.files?.stop(); this.drafts.clear(); this.progress.clear(); this.notificationHeads.clear(); this.observedInitialState = false; this.userId = s.self.id;
+    if (!s.self && el<HTMLDialogElement>('im-dialog').open) el<HTMLDialogElement>('im-dialog').close();
+    if (this.userId && s.self && this.userId !== s.self.id) {
+      this.files?.stop(); this.files = undefined; this.userId = undefined;
+      this.drafts.clear(); this.progress.clear(); this.notificationHeads.clear(); this.observedInitialState = false;
+      this.activeChat = undefined;
+      this.draw(el('chat-page'), welcome());
+      el<HTMLDialogElement>('im-dialog').close();
+    }
+    if (s.self && this.config && !this.files) {
+      this.userId = s.self.id;
       this.files = new MessengerFiles(s.self.id,this.client.token,this.config);
       this.files.onNotice = text => this.notice(text);
       this.files.onProgress = (id,label,bytes,mode,finished) => {
@@ -162,6 +170,7 @@ export class Workspace {
     const people = this.people(), title = conversationName(c,people,s.self?.id);
     if (this.activeChat !== c.id) {
       this.tab = 'messages'; this.activeChat = c.id;
+      this.focusChat();
       this.draw(el('chat-page'), `<div class="im-chat-head" id="im-chat-head"></div><div id="im-history" class="im-history" aria-label="聊天记录"></div>
         <div class="im-compose-wrap"><div class="im-compose" id="im-compose"><div id="im-staged"></div><textarea id="im-text" aria-label="消息内容" rows="2"></textarea>
         <div class="im-tools"><div class="im-tools-left">${iconButton('emoji','表情','smile')}${iconButton('attach','添加本地文件','attach')}${iconButton('from-drive','从云盘选择文件','folder')}${iconButton('mode','文件传输方式','sliders')}<span id="im-mode-label"></span></div><button class="im-send" data-action="send" title="发送 (Enter)" aria-label="发送消息">${glyph('send',17)}</button></div></div></div><input id="im-file-input" type="file" multiple hidden>`);
@@ -182,7 +191,7 @@ export class Workspace {
       ${c.kind === 'group' ? groupAvatar(c.memberIds.map(id => people.get(id))) : avatar(peer)}
       <div class="im-head-text"><div class="im-title-line"><strong>${esc(title)}</strong><span>${c.kind === 'group' ? c.memberIds.length+' 位成员' : peer?.online ? '在线' : '离线'}</span></div>
       <div class="im-tabs"><button data-action="messages-tab" aria-pressed="${this.tab === 'messages'}">${glyph('chat',13)}消息</button><button data-action="files-tab" aria-pressed="${this.tab === 'files'}">${glyph('folder',13)}文件</button></div></div>
-      <div class="im-head-tools">${iconButton('invite','添加成员','invite')}${iconButton('members','会话成员','more')}</div></div>`);
+      <div class="im-head-tools">${c.id === MESSENGER_PLAZA_ID ? '' : iconButton('invite','添加成员','invite')}${iconButton('members','会话成员','more')}</div></div>`);
     el<HTMLTextAreaElement>('im-text').placeholder = `发送给 ${title}`;
     el('im-compose').parentElement!.hidden = this.tab !== 'messages';
     this.renderHistory(); this.renderDraft();
@@ -235,20 +244,22 @@ export class Workspace {
       for (const a of d.files) {
         if (a.file || !a.local) continue;
         a.metadata ??= await files.prepare(a.local,d.mode);
+        if (this.files !== files) return;
         a.file = await this.client.registerFile(a.metadata);
       }
+      if (this.files !== files) return;
       await this.client.sendMessage(id,d.text.trim(),d.files.map(a=>a.file!.id));
       d.text = ''; d.files = [];
-      if (this.client.state.activeId === id) { el<HTMLTextAreaElement>('im-text').value = ''; el('im-history').scrollTop = el('im-history').scrollHeight; }
+      if (this.files === files && this.client.state.activeId === id && el('im-text')) { el<HTMLTextAreaElement>('im-text').value = ''; el('im-history').scrollTop = el('im-history').scrollHeight; }
     } finally {
       d.busy = false;
-      if (this.client.state.activeId === id) { this.renderDraft(); if (this.current === 'chat') el<HTMLTextAreaElement>('im-text').focus(); }
+      if (this.files === files && this.client.state.activeId === id && el('im-text')) { this.renderDraft(); if (this.current === 'chat') el<HTMLTextAreaElement>('im-text').focus(); }
     }
   }
   private renderDriveShell() {
     el('im-drive').innerHTML = `<aside class="im-drive-nav"><h2>${glyph('folder',21)}云盘</h2><button class="im-drive-active" data-action="all-files">${glyph('folder',17)}我的文件</button><a href="/send" data-page-mode="share">${glyph('link',17)}链接分享</a></aside>
       <div class="im-drive-main"><div class="im-drive-top"><h1>我的文件</h1><label class="im-drive-search">${glyph('search',16)}<input id="im-drive-q" aria-label="搜索我的文件" placeholder="搜索文件"></label></div>
-      <p class="im-drive-note">${glyph('info',16)}聊天中发送的文件会出现在这里。对方下载时，请保持发送设备在线。</p>
+      <p class="im-drive-note">${glyph('info',16)}聊天中发送的文件会出现在这里。下载时请保持发送设备在线。连续离线 12 小时后，云盘文件记录会被清空。</p>
       <div class="im-file-list"><div class="im-table-head"><span>文件名</span><span>大小</span><button data-action="sort">发送时间 ${glyph('down',13)}</button><span></span></div><div id="im-drive-rows"></div></div></div>`;
     el<HTMLInputElement>('im-drive-q').oninput = e => { this.driveSearch = (e.target as HTMLInputElement).value; this.renderDrive(); };
   }

@@ -1,4 +1,4 @@
-import { isMessengerAvatarImage, type MessengerConversation, type MessengerFile, type MessengerUser } from '../src/shared/messenger';
+import { isMessengerAvatarImage, MESSENGER_PLAZA_ID, type MessengerConversation, type MessengerFile, type MessengerUser } from '../src/shared/messenger';
 
 export type PageMode = 'chat' | 'drive' | 'share' | 'admin';
 export const escapeHtml = (value: string) => value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
@@ -54,6 +54,7 @@ export function groupAvatar(people: (MessengerUser | undefined)[]) {
   return `<span class="im-group-avatar" aria-hidden="true">${people.slice(0, 4).map(p => avatar(p)).join('')}</span>`;
 }
 export function conversationName(conv: MessengerConversation, users: Map<string, MessengerUser>, selfId?: string) {
+  if (conv.id === MESSENGER_PLAZA_ID) return '广场';
   const names = conv.memberIds.filter(id => id !== selfId).map(id => users.get(id)?.name || '已离开的用户');
   if (conv.kind === 'dm') return names[0] || '私聊';
   return names.slice(0, 4).join('、') || '群聊';

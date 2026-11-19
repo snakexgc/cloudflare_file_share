@@ -1,4 +1,4 @@
-import { MESSENGER_RETENTION_MS, type MessengerFile, type MessengerTransfer } from '../shared/messenger';
+import { messengerAccountCutoff, type MessengerFile, type MessengerTransfer } from '../shared/messenger';
 import type { ShareInfo } from '../shared/types';
 import type { Env } from './config';
 import { fileFields, ticketSql, ticketView, visibleRoomIds } from './messenger-view';
@@ -28,7 +28,7 @@ export async function revokeMessengerRooms(env: Env, fileId?: string) {
   }));
 }
 export async function transferApi(request: Request, env: Env, user: string, ticketId?: string) {
-  const db = env.DB, now = Date.now(), cutoff = now - MESSENGER_RETENTION_MS;
+  const db = env.DB, now = Date.now(), cutoff = messengerAccountCutoff(now);
   const lookup = (key: string) => db.prepare(ticketSql + ' AND t.id = ?4').bind(user, cutoff, now, key).first<MessengerTransfer>();
   if (!ticketId && request.method === 'POST') {
     const data = await readJson(request, 1024);

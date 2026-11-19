@@ -1,4 +1,5 @@
-import { MESSENGER_AVATAR_PATH, MESSENGER_ONLINE_MS, MESSENGER_RETENTION_MS, type MessengerFile, type MessengerState, type MessengerTransfer } from '../shared/messenger';
+import { MESSENGER_AVATAR_PATH, MESSENGER_GROUP_RETENTION_MS, MESSENGER_HEARTBEAT_WRITE_INTERVAL_MS, MESSENGER_MESSAGE_RETENTION_MS, MESSENGER_ONLINE_MS,
+  MESSENGER_PLAZA_ID, MESSENGER_RETENTION_MS, messengerAccountCutoff, type MessengerFile, type MessengerState, type MessengerTransfer } from '../shared/messenger';
 import { chatName } from '../shared/chat';
 import { limits, type Env } from './config';
 import { assetId, revokeMessengerRooms, transferApi } from './messenger-transfers';
@@ -8,12 +9,18 @@ import { assert, bearer, digest, id, json, readJson } from './util';
 
 const hexSecret = (v: unknown): v is string => typeof v === 'string' && /^[a-f0-9]{64}$/.test(v);
 const hexId = (v: unknown): v is string => typeof v === 'string' && /^[a-f0-9]{32}$/.test(v);
-const cutoffAt = (now: number) => now - MESSENGER_RETENTION_MS;
 export async function sweepMessenger(env: Env, now: number) {
   const db = env.DB;
+  const lastOnline = now - MESSENGER_ONLINE_MS;
   await db.batch([
     db.prepare('DELETE FROM messenger_transfers WHERE expires_at <= ?').bind(now),
-    db.prepare('DELETE FROM messenger_users WHERE last_seen <= ?').bind(cutoffAt(now)),
+    db.prepare(`DELETE FROM messenger_conversations WHERE id IN (
+      SELECT id FROM messenger_room_presence WHERE kind = 'group' AND id <> ? AND last_seen <= ?
+    )`).bind(MESSENGER_PLAZA_ID, lastOnline - MESSENGER_GROUP_RETENTION_MS),
+    db.prepare(`DELETE FROM messenger_messages WHERE conversation_id IN (
+      SELECT id FROM messenger_room_presence WHERE last_seen <= ?
+    )`).bind(lastOnline - MESSENGER_MESSAGE_RETENTION_MS),
+    db.prepare('DELETE FROM messenger_users WHERE last_seen <= ?').bind(messengerAccountCutoff(now)),
   ]);
   await revokeMessengerRooms(env);
 }
@@ -26,7 +33,7 @@ async function identity(request: Request, db: D1Database, now: number) {
   // visible identity but is never stored and cannot authenticate another browser.
   const userId = digest(`messenger:${data.fingerprint}:${id()}`).slice(0, 32);
   const results = await db.batch([
-    db.prepare('DELETE FROM messenger_users WHERE credential_hash = ? AND last_seen <= ?').bind(hash, cutoffAt(now)),
+    db.prepare('DELETE FROM messenger_users WHERE credential_hash = ? AND last_seen <= ?').bind(hash, messengerAccountCutoff(now)),
     db.prepare(`INSERT INTO messenger_users (id, credential_hash, name, avatar, last_seen) VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(credential_hash) DO UPDATE SET last_seen = MAX(last_seen, excluded.last_seen)`)
       .bind(userId, hash, `访客-${userId.slice(0, 6)}`, '👤', now),
@@ -40,13 +47,13 @@ type PollUser = UserRow & { personalRevision: number; rosterRevision: number; ch
 async function authenticate(request: Request, db: D1Database, now: number, polling: boolean) {
   const credential = bearer(request);
   assert(credential, 401, 'identity_required', '请先连接自己的设备身份');
-  const hash = digest(credential), cutoff = cutoffAt(now);
+  const hash = digest(credential), cutoff = messengerAccountCutoff(now);
   const revisions = polling ? `, revision AS personalRevision, (SELECT revision FROM messenger_directory WHERE id = 1) AS rosterRevision,
     (SELECT COALESCE(SUM(c.revision + 1), 0) FROM messenger_members mm JOIN messenger_conversations c ON c.id = mm.conversation_id
      WHERE mm.user_id = messenger_users.id) AS chatRevision` : '';
   const result = await db.batch([
     db.prepare('UPDATE messenger_users SET last_seen = ? WHERE credential_hash = ? AND last_seen > ? AND last_seen <= ?')
-      .bind(now, hash, cutoff, now - 15_000),
+      .bind(now, hash, cutoff, now - MESSENGER_HEARTBEAT_WRITE_INTERVAL_MS),
     db.prepare(`SELECT ${userFields} ${revisions} FROM messenger_users WHERE credential_hash = ? AND last_seen > ?`).bind(hash, cutoff),
   ]);
   const row = result[1].results[0] as unknown as PollUser | undefined;
@@ -89,13 +96,15 @@ async function updateProfile(request: Request, db: D1Database, user: string, now
 }
 
 async function avatarResponse(db: D1Database, path: string, user: string, now: number) {
-  const row = await db.prepare(`SELECT a.image FROM messenger_users u JOIN messenger_avatars a ON a.user_id = u.id
-    WHERE u.id = ? AND u.avatar = ? AND u.last_seen > ?`).bind(user, path, cutoffAt(now)).first<string>('image');
-  assert(row, 404, 'avatar_not_found', '头像不存在');
-  const comma = row.indexOf(',');
-  const raw = atob(row.slice(comma + 1));
+  const row = await db.prepare(`SELECT a.image, u.last_seen AS lastSeen FROM messenger_users u JOIN messenger_avatars a ON a.user_id = u.id
+    WHERE u.id = ? AND u.avatar = ? AND u.last_seen > ?`).bind(user, path, messengerAccountCutoff(now)).first<{ image: string; lastSeen: number }>();
+  const cutoff = messengerAccountCutoff(Date.now());
+  assert(row && row.lastSeen > cutoff, 404, 'avatar_not_found', '头像不存在');
+  const maxAge = Math.floor((row.lastSeen - cutoff) / 1000);
+  const raw = atob(row.image.slice(row.image.indexOf(',') + 1));
   return new Response(Uint8Array.from(raw, ch => ch.charCodeAt(0)), { headers: {
-    'Content-Type': row.slice('data:'.length, row.indexOf(';')), 'Cache-Control': 'private, max-age=86400, immutable',
+    'Content-Type': row.image.slice('data:'.length, row.image.indexOf(';')),
+    'Cache-Control': `private, max-age=${maxAge}, immutable, must-revalidate`,
     'Cross-Origin-Resource-Policy': 'same-origin',
   } });
 }
@@ -105,11 +114,12 @@ function snapshotRevision(me: PollUser, refreshAt: number) {
 }
 
 async function snapshot(db: D1Database, me: PollUser, now: number, since: string | null) {
+  const presenceLeaseMs = Math.min(MESSENGER_ONLINE_MS, me.lastSeen + MESSENGER_ONLINE_MS - now);
   const previousExpiry = Number(since?.split('.')[1]);
   if (previousExpiry > now && previousExpiry <= now + MESSENGER_ONLINE_MS && since === snapshotRevision(me, previousExpiry)) {
-    return json({ unchanged: true, revision: since, refreshAt: previousExpiry });
+    return json({ unchanged: true, revision: since, refreshAt: previousExpiry, presenceLeaseMs });
   }
-  const cutoff = cutoffAt(now);
+  const cutoff = messengerAccountCutoff(now);
   const rows = await db.batch([
     db.prepare(`SELECT ${userFields} FROM messenger_users WHERE id <> ? AND last_seen > ? ORDER BY last_seen DESC, id`).bind(me.id, cutoff),
     db.prepare(conversationSql + ' ORDER BY COALESCE(m.created_at, c.created_at) DESC, c.id').bind(me.id, cutoff),
@@ -117,6 +127,7 @@ async function snapshot(db: D1Database, me: PollUser, now: number, since: string
     db.prepare(ticketSql + ' ORDER BY t.created_at DESC, t.id').bind(me.id, cutoff, now),
   ]);
   const state: MessengerState = {
+    presenceLeaseMs,
     me: publicUser(me, now), users: (rows[0].results as unknown as UserRow[]).map(row => publicUser(row, now)),
     conversations: (rows[1].results as unknown as ConversationRow[]).map(conversationView),
     files: rows[2].results as unknown as MessengerFile[], transfers: (rows[3].results as unknown as MessengerTransfer[]).map(ticketView),
@@ -124,7 +135,7 @@ async function snapshot(db: D1Database, me: PollUser, now: number, since: string
   // A lease, file owner's account or ticket can expire even when no write occurs.
   // Re-evaluate logical visibility at the first such deadline, including before cron.
   let refreshAt = now + MESSENGER_ONLINE_MS;
-  for (const user of state.users) refreshAt = Math.min(refreshAt, user.lastSeen + (user.online ? MESSENGER_ONLINE_MS : MESSENGER_RETENTION_MS));
+  for (const user of state.users) refreshAt = Math.min(refreshAt, user.lastSeen + MESSENGER_ONLINE_MS + (user.online ? 0 : MESSENGER_RETENTION_MS));
   for (const ticket of state.transfers) refreshAt = Math.min(refreshAt, ticket.expiresAt);
   state.revision = snapshotRevision(me, refreshAt); state.refreshAt = refreshAt;
   return json(state);
@@ -135,7 +146,7 @@ async function roomView(db: D1Database, user: string, cutoff: number, room: stri
   assert(row, 404, 'conversation_not_found', '会话不存在'); return conversationView(row);
 }
 async function conversations(request: Request, db: D1Database, user: string, now: number, sourceRoom?: string) {
-  const cutoff = cutoffAt(now);
+  const cutoff = messengerAccountCutoff(now);
   const original = sourceRoom ? await roomView(db, user, cutoff, sourceRoom) : undefined;
   const data = await readJson(request, 8192);
   const input = data.userIds ?? (data.userId ? [data.userId] : undefined);
@@ -163,7 +174,7 @@ async function conversations(request: Request, db: D1Database, user: string, now
 }
 
 async function messages(request: Request, env: Env, user: string, room: string, now: number) {
-  const db = env.DB, cutoff = cutoffAt(now);
+  const db = env.DB, cutoff = messengerAccountCutoff(now);
   const member = await db.prepare(visibleRoomIds + ' AND c.id = ?3').bind(user, cutoff, room).first('id');
   assert(member, 404, 'conversation_not_found', '会话不存在');
   if (request.method === 'GET') {

@@ -76,6 +76,63 @@ describe('公共聊天室与用户名', () => {
     await call('/api/chat/leave', { token: resumed.sessionToken, generation: resumed.generation });
     expect((await post(resumed)).status).toBe(401);
   });
+  it('兼容聊天室从最后一人离开起计时，十分钟内重返可保留消息，再次离开重新计时', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const start = Date.now();
+    const a = await join();
+    await post(a, '临时历史');
+    await call('/api/chat/leave', { token: a.sessionToken });
+    const stub = env.CHAT.get(env.CHAT.idFromName('public'));
+    expect(await runInDurableObject(stub, (_instance, ctx) => ctx.storage.getAlarm())).toBe(start + 600_000);
+    vi.setSystemTime(start + 599_999);
+    const b = await join();
+    expect(b.snapshot.messages.map(m => m.text)).toEqual(['临时历史']);
+    await call('/api/chat/leave', { token: b.sessionToken });
+    await abortAllDurableObjects();
+    vi.setSystemTime(start + 599_999 + 600_000);
+    expect((await join()).snapshot.messages).toEqual([]);
+  });
+  it('兼容聊天室无人续租时，即使 Alarm 迟到也在新访客进入前清空历史', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const start = Date.now();
+    await post(await join(), '无人续租');
+    vi.setSystemTime(start + defaults.leaseMs + 600_000);
+    expect((await join()).snapshot.messages).toEqual([]);
+  });
+  it.each([
+    { offset: -1, expected: ['自动心跳续租'] },
+    { offset: 0, expected: [] },
+  ])('关闭 WebSocket 后按最后一次自动心跳计算历史截止时间（相差 $offset 毫秒）', async ({ offset, expected }) => {
+    // The runtime timestamps auto-responses itself; start the application clock
+    // a little earlier so this ping is distinguishable from the HTTP handshake.
+    const start = Date.now() - 10_000;
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(start);
+    const a = await join();
+    await post(a, '自动心跳续租');
+    const stub = env.CHAT.get(env.CHAT.idFromName('public'));
+    const response = await call('/api/chat/ws', undefined, undefined, 'GET', {
+      Upgrade: 'websocket', 'Sec-WebSocket-Protocol': `chat, token.${a.sessionToken}`,
+    });
+    expect(response.status).toBe(101);
+    const socket = response.webSocket!;
+    socket.accept(); sockets.push(socket);
+    const pong = next(socket, message => message === 'chat-pong');
+    socket.send('chat-ping'); await pong;
+    const lastPing = await runInDurableObject(stub, (_, ctx) =>
+      ctx.getWebSocketAutoResponseTimestamp(ctx.getWebSockets(a.snapshot.self.id)[0])!.getTime());
+    expect(lastPing).toBeGreaterThan(start);
+    vi.setSystemTime(lastPing + 3000);
+    socket.close(1000, 'tab closed');
+    await vi.waitFor(async () => {
+      const open = await runInDurableObject(stub, (_, ctx) =>
+        ctx.getWebSockets(a.snapshot.self.id).some(s => s.readyState === WebSocket.OPEN));
+      expect(open).toBe(false);
+    });
+    await abortAllDurableObjects();
+    vi.setSystemTime(lastPing + defaults.leaseMs + 600_000 + offset);
+    expect((await join()).snapshot.messages.map(message => message.text)).toEqual(expected);
+  });
   it('匿名无会话、伪造令牌和跨站请求均不能发言或改名', async () => {
     expect((await call('/api/chat/messages', { text: 'x', nonce: id() })).status).toBe(401);
     expect((await call('/api/chat/name', { name: 'x' }, 'f'.repeat(64))).status).toBe(401);

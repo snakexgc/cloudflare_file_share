@@ -1,7 +1,7 @@
 import './workspace-dialogs.css';
 import { chatName } from '../src/shared/chat';
 import type { MessengerClient } from '../src/client/messenger';
-import type { MessengerConversation, MessengerFile, MessengerUser } from '../src/shared/messenger';
+import { MESSENGER_PLAZA_ID, type MessengerConversation, type MessengerFile, type MessengerUser } from '../src/shared/messenger';
 import { avatar, conversationName, escapeHtml, fileSymbol, formatSize, glyph, groupAvatar } from './workspace-view';
 
 type DialogActions = {
@@ -198,7 +198,8 @@ export class WorkspaceDialogs {
       submit.textContent = conversation ? picked.size ? `邀请（${picked.size}）` : '邀请' : picked.size > 1 ? `发起群聊（${picked.size}）` : '开始聊天';
     };
     const render = () => {
-      const memberIds = this.client.state.conversations.find(item => item.id === conversation?.id)?.memberIds ?? conversation?.memberIds;
+      const memberIds = this.client.state.conversations.find(item => item.id === conversation?.id)?.memberIds;
+      if (conversation && !memberIds) { this.dialog.close(); return; }
       const candidates = this.client.state.users.filter(user => !memberIds?.includes(user.id));
       for (const id of picked) if (!candidates.some(user => user.id === id)) picked.delete(id);
       const matches = candidates.filter(user => norm(user.name).includes(norm(search.value)));
@@ -221,12 +222,22 @@ export class WorkspaceDialogs {
   }
 
   members(conversation: MessengerConversation) {
-    const users = this.users();
-    this.show(`会话成员（${conversation.memberIds.length}）`, `<div class="imd-list imd-member-list">${conversation.memberIds.map(id => {
-      const user = users.get(id);
-      return `<div class="imd-row">${avatar(user, true)}${copy(user?.name ?? '已离开的用户', id === this.client.state.self?.id ? '我' : status(user))}</div>`;
-    }).join('')}</div><div class="imd-footer"><button type="button" class="imd-button imd-primary imd-invite">${glyph('invite', 16)}邀请成员</button></div>`);
-    this.el<HTMLButtonElement>('.imd-invite').onclick = () => this.people(conversation);
+    const invite = conversation.id === MESSENGER_PLAZA_ID ? '' : `<div class="imd-footer"><button type="button" class="imd-button imd-primary imd-invite">${glyph('invite', 16)}邀请成员</button></div>`;
+    this.show('会话成员', `<div class="imd-list imd-member-list"></div>${invite}`);
+    const update = this.renderList(this.el('.imd-member-list'));
+    const button = this.dialog.querySelector<HTMLButtonElement>('.imd-invite');
+    if (button) button.onclick = () => this.people(conversation);
+    this.updateResults = () => {
+      const current = this.client.state.conversations.find(item => item.id === conversation.id);
+      if (!current) { this.dialog.close(); return; }
+      const users = this.users();
+      this.el('#imd-title').textContent = `会话成员（${current.memberIds.length}）`;
+      update(current.memberIds.map(id => {
+        const user = users.get(id);
+        return `<div class="imd-row">${avatar(user, true)}${copy(user?.name ?? '已离开的用户', id === this.client.state.self?.id ? '我' : status(user))}</div>`;
+      }).join(''));
+    };
+    this.updateResults();
   }
 
   search() {

@@ -1,6 +1,7 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { MessengerClient } from '../src/client/messenger';
 import type { MessengerConversation, MessengerMessage, MessengerState } from '../src/shared/messenger';
+import { conversationName } from '../web/workspace-view';
 
 const me = { id: 'self', name: '我', avatar: '猫', online: true, lastSeen: 1000 };
 const conversation = (id: string): MessengerConversation => ({ id, kind: 'dm', memberIds: ['self', id], createdAt: 1, updatedAt: 1 });
@@ -9,6 +10,8 @@ const message = (conversationId: string, sequence: number): MessengerMessage => 
   conversationId, id: String(sequence), sequence, senderId: me.id, text: String(sequence), createdAt: sequence,
 });
 const clients: MessengerClient[] = [];
+const plazaId = '00000000000000000000000000000000';
+const plaza = { ...conversation(plazaId), kind: 'group' as const, memberIds: ['self'] };
 const client = () => { const value = new MessengerClient(); clients.push(value); return value; };
 afterEach(() => { for (const value of clients.splice(0)) value.stop(); vi.unstubAllGlobals(); });
 
@@ -27,6 +30,147 @@ function deferred<T>() {
   const promise = new Promise<T>(accept => { resolve = accept; });
   return { promise, resolve };
 }
+const unavailable = () => Response.json({ error: 'unavailable', message: '暂时无法连接' }, { status: 503 });
+
+it('打开页面进入广场并读取消息，切换私聊或返回列表后轮询保留选择', async () => {
+  const value = client();
+  let rooms = [conversation('a'), plaza];
+  mockApi(path => {
+    if (path.startsWith('/state')) return Response.json({ ...state([]), conversations: rooms });
+    if (path === '/conversations/' + plazaId + '/messages') return Response.json({ messages: [message(plazaId, 1)], hasMore: false });
+  });
+  await value.start();
+  expect(value.state.activeId).toBe(plazaId);
+  expect(value.state.messages).toEqual([message(plazaId, 1)]);
+  expect(conversationName(plaza, new Map(), me.id)).toBe('广场');
+  await value.openConversation('a'); await value.refresh();
+  expect(value.state.activeId).toBe('a');
+  rooms = [plaza]; await value.refresh();
+  expect(value.state.activeId).toBe(plazaId);
+  await value.openConversation(null); await value.refresh();
+  expect(value.state.activeId).toBeNull();
+});
+
+it('服务端报告会话历史已清空时立即清除旧分页，即使随后历史请求失败', async () => {
+  const value = client();
+  let expired = false;
+  mockApi(path => {
+    if (path.startsWith('/state')) return Response.json({ ...state([]), conversations: [
+      { ...conversation('a'), revision: expired ? 2 : 1, lastMessage: expired ? undefined : message('a', 1) },
+    ] });
+    if (path === '/conversations/a/messages') return expired ? unavailable()
+      : Response.json({ messages: [message('a', 1)], hasMore: false });
+  });
+  await value.start(); await value.openConversation('a');
+  expect(value.state.messages).toHaveLength(1);
+  expired = true; await value.refresh().catch(() => {});
+  expect(value.state.messages).toEqual([]);
+});
+
+it('另一个标签页续建身份后，首个状态响应清除旧身份的云盘和广场历史', async () => {
+  const value = client();
+  let renewed = false;
+  const file = { id: 'old-file', ownerId: me.id, name: '旧文件', size: 1, mime: 'text/plain', lastModified: 1, transferMode: 'auto', createdAt: 1 };
+  const newUser = { ...me, id: 'renewed' };
+  mockApi(path => {
+    if (path.startsWith('/state')) return Response.json({
+      ...state([]), me: renewed ? newUser : me, files: renewed ? [] : [file],
+      conversations: [{ ...plaza, memberIds: [renewed ? newUser.id : me.id], lastMessage: renewed ? undefined : message(plazaId, 1) }],
+    });
+    if (path.endsWith('/messages')) return renewed ? unavailable() : Response.json({ messages: [message(plazaId, 1)], hasMore: false });
+  });
+  await value.start(); await value.openConversation(plazaId);
+  expect(value.state.drive).toHaveLength(1);
+  expect(value.state.messages).toHaveLength(1);
+  const leaks: string[] = [];
+  value.onChange = s => { if (s.self?.id === newUser.id && (s.drive.length || s.messages.length)) leaks.push(s.self.id); };
+  renewed = true; await value.refresh().catch(() => {});
+  expect(value.state.self?.id).toBe(newUser.id);
+  expect(leaks).toEqual([]);
+});
+
+it('失联超过消息保留期后，重新查询前先隐藏消息内容和列表预览', async () => {
+  const value = client(), clock = vi.spyOn(Date, 'now');
+  const before = Date.now(), pending = deferred<Response>();
+  clock.mockReturnValue(before);
+  let offline = false;
+  mockApi(path => {
+    if (path.startsWith('/state')) return offline ? pending.promise : Response.json({
+      ...state([]), conversations: [{ ...conversation('a'), lastMessage: message('a', 1) }],
+    });
+    if (path.endsWith('/messages')) return Response.json({ messages: [message('a', 1)], hasMore: false });
+  });
+  await value.start(); await value.openConversation('a');
+  // The final poll may reuse a heartbeat written almost 15 seconds earlier.
+  offline = true; clock.mockReturnValue(before + 10 * 60_000 + 45_000);
+  const refresh = value.refresh();
+  try {
+    expect(value.state.messages).toEqual([]);
+    expect(value.state.conversations[0].lastMessage).toBeUndefined();
+  } finally { pending.resolve(unavailable()); await refresh.catch(() => {}); }
+});
+
+it('按最近一次条件轮询回传的实际在线租期判断离线历史截止时间', async () => {
+  const value = client(), before = Date.now();
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(before);
+  let disconnected = false;
+  mockApi(path => {
+    if (path.startsWith('/state') && disconnected) return Promise.reject(new TypeError('offline'));
+    if (path === '/state') return Response.json({ ...state(['a']), revision: 'v', refreshAt: before + 60_000, presenceLeaseMs: 60_000 });
+    if (path === '/state?since=v') return Response.json({ unchanged: true, revision: 'v', refreshAt: before + 60_000, presenceLeaseMs: 60_000 });
+    if (path.endsWith('/messages')) return Response.json({ messages: [message('a', 1)], hasMore: false });
+  });
+  await value.start(); await value.openConversation('a');
+  const renewed = before + 20_000;
+  clock.mockReturnValue(renewed); await value.refresh(false); disconnected = true;
+  clock.mockReturnValue(renewed + 11 * 60_000 - 1); await value.refresh(false).catch(() => {});
+  expect(value.state.messages).toHaveLength(1);
+  clock.mockReturnValue(renewed + 11 * 60_000); await value.refresh(false).catch(() => {});
+  expect(value.state.messages).toEqual([]);
+});
+
+it('长时间断网时依次隐藏普通群和云盘，重新核实时保留仍有效的会话选择', async () => {
+  const value = client(), before = Date.now();
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(before);
+  const group = { ...conversation('g'), kind: 'group' as const };
+  const file = { id: 'f', name: '文件', ownerId: me.id, size: 1, mime: 'text/plain', lastModified: 1, createdAt: 1, transferMode: 'auto' };
+  let reachable = true;
+  mockApi(path => {
+    if (path.startsWith('/state')) return reachable
+      ? Response.json({ ...state([]), conversations: [plaza, group], files: [file] })
+      : Promise.reject(new TypeError('offline'));
+  });
+  await value.start(); await value.openConversation(group.id);
+  reachable = false; clock.mockReturnValue(before + 61 * 60_000);
+  await value.refresh().catch(() => {});
+  expect(value.state.conversations.map(c => c.id)).toEqual([plazaId]);
+  expect(value.state.drive).toHaveLength(1);
+  clock.mockReturnValue(before + 721 * 60_000);
+  await value.refresh().catch(() => {});
+  expect(value.state.self).toBeNull();
+  expect(value.state.drive).toEqual([]);
+  reachable = true; await value.refresh();
+  expect(value.state.activeId).toBe(group.id);
+  expect(value.state.drive).toHaveLength(1);
+});
+
+it('挂起的分页和发信响应在断网历史已隐藏后返回也无法恢复旧消息', async () => {
+  const value = client(), before = Date.now(), older = deferred<Response>(), send = deferred<Response>();
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(before);
+  let connected = true;
+  mockApi((path, init) => {
+    if (path.startsWith('/state')) return connected ? Response.json(state(['a'])) : Promise.reject(new TypeError('offline'));
+    if (path.endsWith('?before=2')) return older.promise;
+    if (path.endsWith('/messages') && init?.method === 'POST') return send.promise;
+    if (path.endsWith('/messages')) return Response.json({ messages: [message('a', 2)], hasMore: true });
+  });
+  await value.start(); await value.openConversation('a');
+  const reads = value.loadOlder(), writes = value.sendMessage('a', '3');
+  connected = false; clock.mockReturnValue(before + 11 * 60_000); await value.refresh().catch(() => {});
+  older.resolve(Response.json({ messages: [message('a', 1)], hasMore: false }));
+  send.resolve(Response.json({ message: message('a', 3) })); await Promise.all([reads, writes]);
+  expect(value.state.messages).toEqual([]);
+});
 
 it('同一浏览器重用凭据和指纹，另一无存储浏览器仍可独立登录', async () => {
   const memory = new Map<string, string>();
